@@ -2,7 +2,8 @@
   "name": "tracker-sdk-static",
   "private": true,
   "scripts": {
-    "build": "node build.js"
+    "build": "node build.js",
+    "test": "node test/sdk.test.js"
   },
   "devDependencies": {
     "@babel/core": "^7.28.0",
