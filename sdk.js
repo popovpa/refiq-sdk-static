@@ -69,11 +69,16 @@
     var SID_KEY = '_refiq_sid';
     var SEQ_KEY = '_refiq_seq';
     var SACT_KEY = '_refiq_sact';
+    var TAB_KEY = '_refiq_tab';
+    var SST_KEY = '_refiq_sst';
+    var PVI_KEY = '_refiq_pvi';
+    var LAST_PVID_KEY = '_refiq_last_pvid';
     var ATTR_KEY = '_refiq_attr';
     var CONSENT_KEY = '_refiq_consent';
     var IDB_NAME = 'refiq_cs';
     var IDB_STORE = 'q';
     var IDB_VERSION = 1;
+    var ID_MULTIPLIER = 100001;
     var SCROLL_MILESTONES = [25, 50, 75, 90, 100];
     var MEDIA_MILESTONES = [25, 50, 75, 100];
 
@@ -89,6 +94,11 @@
     var sessionId = '';
     var sequence = 0;
     var pageViewId = '';
+    var previousPageViewId = '';
+    var tabId = '';
+    var sessionStartedTs = 0;
+    var pageSnapshots = {};
+    var snapshotRevisions = {};
     var rqcidCapturedAtMs = 0;
     var memoryQueue = [];
     var inflight = false;
@@ -96,8 +106,14 @@
     var retryAttempt = 0;
     var retryTimer = 0;
     var idbAvailable = !!(window.indexedDB);
+    var idbDb = null;
+    var lastFinalEventIds = [];
+    var finalizedPageViewId = '';
+    var diagnostics = { rejectedEvents: 0, lastRejectReason: '', keepaliveAttempts: 0, invalidIdbEvents: 0 };
     var consentState = { analytics: 'unknown', updatedAtMs: 0, policyVersion: '' };
     var landingPath = '';
+    var landingOrigin = '';
+    var landingHostname = '';
     var landingReferrer = '';
     var firstUtm = null;
     var pageStartedAt = 0;
@@ -113,9 +129,9 @@
     var scrollTimes = {};
     var lastScrollY = 0;
     var scrollRaf = 0;
-    var engagementSentFor = '';
     var mediaSeen = {};
     var vitals = {};
+    var clsObserved = false;
     var observers = [];
 
     if (isArray(queued)) {
@@ -152,6 +168,34 @@
       return Math.round(value);
     }
 
+    function toInteger(value) {
+      if (typeof value !== 'number' || !isFinite(value)) {
+        return undefined;
+      }
+      return Math.round(value);
+    }
+
+    function keepNumber(value) {
+      if (typeof value !== 'number' || !isFinite(value)) {
+        return undefined;
+      }
+      return value;
+    }
+
+    function ratio(part, whole) {
+      if (!(whole > 0) || typeof part !== 'number' || !isFinite(part)) {
+        return -1;
+      }
+      var value = part / whole;
+      if (value < 0) {
+        return 0;
+      }
+      if (value > 1) {
+        return 1;
+      }
+      return Math.round(value * 10000) / 10000;
+    }
+
     function whenIdle(fn, timeout) {
       try {
         if (typeof window.requestIdleCallback === 'function') {
@@ -161,6 +205,8 @@
       } catch (e) {}
       setTimeout(isolate(fn), 1);
     }
+
+    var ID_RANDOM_MAX = 100000;
 
     function randomId(len) {
       var alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
@@ -180,6 +226,101 @@
         out += alphabet[Math.floor(Math.random() * 36)];
       }
       return out;
+    }
+
+    function mintId() {
+      var timestamp = now();
+      if (!(timestamp > 0)) {
+        timestamp = 1;
+      }
+      var random = 0;
+      try {
+        if (window.crypto && window.crypto.getRandomValues) {
+          var bytes = new Uint32Array(1);
+          window.crypto.getRandomValues(bytes);
+          random = bytes[0] % (ID_RANDOM_MAX + 1);
+        } else {
+          random = Math.floor(Math.random() * (ID_RANDOM_MAX + 1));
+        }
+      } catch (e) {
+        random = Math.floor(Math.random() * (ID_RANDOM_MAX + 1));
+      }
+      if (random < 0 || random > ID_RANDOM_MAX) {
+        random = 0;
+      }
+      return String(timestamp) + '.' + String(random);
+    }
+
+    function isCodecId(value) {
+      if (!value || typeof value !== 'string') {
+        return false;
+      }
+      var dot = value.indexOf('.');
+      if (dot <= 0 || value.indexOf('.', dot + 1) !== -1) {
+        return false;
+      }
+      var timestamp = value.slice(0, dot);
+      var randomPart = value.slice(dot + 1);
+      if (!/^[1-9][0-9]{0,17}$/.test(timestamp) || !/^(0|[1-9][0-9]{0,5})$/.test(randomPart)) {
+        return false;
+      }
+      var random = parseInt(randomPart, 10);
+      return random >= 0 && random <= ID_RANDOM_MAX;
+    }
+
+    function mulDecimalString(numStr, factor) {
+      var carry = 0;
+      var out = [];
+      var i;
+      for (i = numStr.length - 1; i >= 0; i--) {
+        var n = (numStr.charCodeAt(i) - 48) * factor + carry;
+        out.push(String(n % 10));
+        carry = Math.floor(n / 10);
+      }
+      while (carry > 0) {
+        out.push(String(carry % 10));
+        carry = Math.floor(carry / 10);
+      }
+      out.reverse();
+      return out.join('') || '0';
+    }
+
+    function addDecimalString(numStr, addend) {
+      var carry = addend;
+      var out = [];
+      var i;
+      for (i = numStr.length - 1; i >= 0; i--) {
+        var n = numStr.charCodeAt(i) - 48 + carry;
+        out.push(String(n % 10));
+        carry = Math.floor(n / 10);
+      }
+      while (carry > 0) {
+        out.push(String(carry % 10));
+        carry = Math.floor(carry / 10);
+      }
+      out.reverse();
+      return out.join('') || '0';
+    }
+
+    function codecIdToServerIdString(id) {
+      if (!id || typeof id !== 'string') {
+        return '';
+      }
+      if (/^[1-9][0-9]{0,18}$/.test(id)) {
+        return id;
+      }
+      if (!isCodecId(id)) {
+        return '';
+      }
+      var dot = id.indexOf('.');
+      var timestamp = id.slice(0, dot);
+      var random = parseInt(id.slice(dot + 1), 10) || 0;
+      try {
+        if (typeof BigInt === 'function') {
+          return String(BigInt(timestamp) * BigInt(ID_MULTIPLIER) + BigInt(random));
+        }
+      } catch (e) {}
+      return addDecimalString(mulDecimalString(timestamp, ID_MULTIPLIER), random);
     }
 
     function readCookieNamed(name) {
@@ -392,8 +533,8 @@
         return visitorId;
       }
       visitorId = readStorage(window.localStorage, VID_KEY) || readCookieNamed(VID_KEY);
-      if (!visitorId) {
-        visitorId = randomId(16);
+      if (!isCodecId(visitorId)) {
+        visitorId = mintId();
       }
       writeStorage(window.localStorage, visitorId, VID_KEY);
       writeCookie(VID_KEY, visitorId, COOKIE_MAX_AGE);
@@ -409,14 +550,35 @@
         sessionId = storedSid;
         sequence = storedSeq;
       }
-      if (!sessionId || (lastAct && t - lastAct > SESSION_TIMEOUT_MS)) {
-        sessionId = randomId(16);
+      if (!isCodecId(sessionId) || (lastAct && t - lastAct > SESSION_TIMEOUT_MS)) {
+        sessionId = mintId();
         sequence = 0;
+        sessionStartedTs = t;
+        previousPageViewId = '';
         writeStorage(window.sessionStorage, sessionId, SID_KEY);
         writeStorage(window.sessionStorage, '0', SEQ_KEY);
+        writeStorage(window.sessionStorage, String(t), SST_KEY);
+        writeStorage(window.sessionStorage, '0', PVI_KEY);
+        writeStorage(window.sessionStorage, '', LAST_PVID_KEY);
+        pageSnapshots = {};
+        snapshotRevisions = {};
+      } else if (!sessionStartedTs) {
+        sessionStartedTs = parseInt(readStorage(window.sessionStorage, SST_KEY), 10) || t;
       }
       writeStorage(window.sessionStorage, String(t), SACT_KEY);
       return sessionId;
+    }
+
+    function ensureTab() {
+      if (isCodecId(tabId)) {
+        return tabId;
+      }
+      tabId = readStorage(window.sessionStorage, TAB_KEY);
+      if (!isCodecId(tabId)) {
+        tabId = mintId();
+        writeStorage(window.sessionStorage, tabId, TAB_KEY);
+      }
+      return tabId;
     }
 
     function nextSequence() {
@@ -431,11 +593,17 @@
       var attr = loadJson(window.sessionStorage, ATTR_KEY) || {};
       if (!attr.landingPath) {
         attr.landingPath = window.location.pathname || '';
+        attr.landingOrigin = window.location.origin || '';
+        attr.landingHostname = window.location.hostname || '';
         attr.landingReferrer = sanitizeReferrer(document.referrer);
         landingPath = attr.landingPath;
+        landingOrigin = attr.landingOrigin;
+        landingHostname = attr.landingHostname;
         landingReferrer = attr.landingReferrer;
       } else {
         landingPath = attr.landingPath;
+        landingOrigin = attr.landingOrigin || '';
+        landingHostname = attr.landingHostname || '';
         landingReferrer = attr.landingReferrer;
       }
       if (!attr.utm) {
@@ -477,9 +645,9 @@
       if (typeof nav.cookieEnabled === 'boolean') out.cookieEnabled = nav.cookieEnabled;
       if (typeof nav.webdriver === 'boolean') out.webdriver = nav.webdriver;
       if (typeof nav.pdfViewerEnabled === 'boolean') out.pdfViewerEnabled = nav.pdfViewerEnabled;
-      if (nav.hardwareConcurrency) out.hardwareConcurrency = nav.hardwareConcurrency;
-      if (nav.deviceMemory) out.deviceMemory = nav.deviceMemory;
-      if (typeof nav.maxTouchPoints === 'number') out.maxTouchPoints = nav.maxTouchPoints;
+      if (nav.hardwareConcurrency != null) out.hardwareConcurrency = toInteger(nav.hardwareConcurrency);
+      if (nav.deviceMemory != null) out.deviceMemory = keepNumber(nav.deviceMemory);
+      if (typeof nav.maxTouchPoints === 'number') out.maxTouchPoints = toInteger(nav.maxTouchPoints);
       try {
         if (nav.userAgentData) {
           out.uaBrands = nav.userAgentData.brands;
@@ -501,33 +669,33 @@
     function collectDevice() {
       var s = window.screen || {};
       var out = {
-        screenWidth: s.width,
-        screenHeight: s.height,
-        availWidth: s.availWidth,
-        availHeight: s.availHeight,
-        colorDepth: s.colorDepth,
-        pixelDepth: s.pixelDepth,
-        devicePixelRatio: window.devicePixelRatio,
-        innerWidth: window.innerWidth,
-        innerHeight: window.innerHeight,
-        outerWidth: window.outerWidth,
-        outerHeight: window.outerHeight,
+        screenWidth: toInteger(s.width),
+        screenHeight: toInteger(s.height),
+        availWidth: toInteger(s.availWidth),
+        availHeight: toInteger(s.availHeight),
+        colorDepth: toInteger(s.colorDepth),
+        pixelDepth: toInteger(s.pixelDepth),
+        devicePixelRatio: keepNumber(window.devicePixelRatio),
+        innerWidth: toInteger(window.innerWidth),
+        innerHeight: toInteger(window.innerHeight),
+        outerWidth: toInteger(window.outerWidth),
+        outerHeight: toInteger(window.outerHeight),
       };
       try {
         if (s.orientation) {
           out.orientationType = s.orientation.type;
-          out.orientationAngle = s.orientation.angle;
+          out.orientationAngle = toInteger(s.orientation.angle);
         }
       } catch (e) {}
       try {
         var vv = window.visualViewport;
         if (vv) {
           out.visualViewport = {
-            width: vv.width,
-            height: vv.height,
-            scale: vv.scale,
-            offsetLeft: vv.offsetLeft,
-            offsetTop: vv.offsetTop,
+            width: keepNumber(vv.width),
+            height: keepNumber(vv.height),
+            scale: keepNumber(vv.scale),
+            offsetLeft: keepNumber(vv.offsetLeft),
+            offsetTop: keepNumber(vv.offsetTop),
           };
         }
       } catch (e) {}
@@ -539,7 +707,7 @@
       var out = {
         language: nav.language,
         languages: nav.languages,
-        timezoneOffsetMinutes: new Date().getTimezoneOffset(),
+        timezoneOffsetMinutes: toInteger(new Date().getTimezoneOffset()),
       };
       try {
         var opts = Intl.DateTimeFormat().resolvedOptions();
@@ -562,8 +730,8 @@
         if (c) {
           if (c.type) out.type = c.type;
           if (c.effectiveType) out.effectiveType = c.effectiveType;
-          if (typeof c.downlink === 'number') out.downlink = c.downlink;
-          if (typeof c.rtt === 'number') out.rtt = c.rtt;
+          if (typeof c.downlink === 'number') out.downlink = keepNumber(c.downlink);
+          if (typeof c.rtt === 'number') out.rtt = toInteger(c.rtt);
           if (typeof c.saveData === 'boolean') out.saveData = c.saveData;
         }
       } catch (e) {}
@@ -581,6 +749,18 @@
       };
     }
 
+    function filteredQueryString() {
+      var query = allowedQuery();
+      var parts = [];
+      var key;
+      for (key in query) {
+        if (Object.prototype.hasOwnProperty.call(query, key) && query[key]) {
+          parts.push(encodeURIComponent(key) + '=' + encodeURIComponent(query[key]));
+        }
+      }
+      return parts.join('&');
+    }
+
     function collectPage() {
       var loc = window.location;
       var navType = '';
@@ -596,36 +776,41 @@
         origin: loc.origin,
         hostname: loc.hostname,
         pathname: loc.pathname,
+        queryFiltered: filteredQueryString(),
         hashRoute: hashRoute(),
         title: document.title || '',
         contentType: document.contentType || '',
         charset: document.characterSet || document.charset || '',
         navigationType: navType,
-        historyLength: window.history ? window.history.length : undefined,
+        historyLength: window.history ? toInteger(window.history.length) : undefined,
         isTopFrame: window.top === window,
         readyState: document.readyState,
         visibilityState: document.visibilityState,
-        documentWidth: document.documentElement ? document.documentElement.scrollWidth : undefined,
-        documentHeight: document.documentElement ? document.documentElement.scrollHeight : undefined,
+        documentWidth: document.documentElement ? toInteger(document.documentElement.scrollWidth) : undefined,
+        documentHeight: document.documentElement ? toInteger(document.documentElement.scrollHeight) : undefined,
+        referrer: sanitizeReferrer(document.referrer) || undefined,
       };
     }
 
     function attributionPayload() {
       var utm = firstUtm || {};
+      var query = allowedQuery();
       return {
         rqcid: stored || undefined,
         rqcidCapturedAtMs: stored ? rqcidCapturedAtMs || undefined : undefined,
-        utmSource: utm.utmSource || undefined,
-        utmMedium: utm.utmMedium || undefined,
-        utmCampaign: utm.utmCampaign || undefined,
-        utmContent: utm.utmContent || undefined,
-        utmTerm: utm.utmTerm || undefined,
-        yclid: utm.yclid || undefined,
-        gclid: utm.gclid || undefined,
-        fbclid: utm.fbclid || undefined,
-        ttclid: utm.ttclid || undefined,
-        vkClickId: utm.vkClickId || undefined,
+        utmSource: query.utm_source || utm.utmSource || undefined,
+        utmMedium: query.utm_medium || utm.utmMedium || undefined,
+        utmCampaign: query.utm_campaign || utm.utmCampaign || undefined,
+        utmContent: query.utm_content || utm.utmContent || undefined,
+        utmTerm: query.utm_term || utm.utmTerm || undefined,
+        yclid: query.yclid || utm.yclid || undefined,
+        gclid: query.gclid || utm.gclid || undefined,
+        fbclid: query.fbclid || utm.fbclid || undefined,
+        ttclid: query.ttclid || utm.ttclid || undefined,
+        vkClickId: query.vk_click_id || query.vkclid || utm.vkClickId || undefined,
         landingPath: landingPath || undefined,
+        landingOrigin: landingOrigin || undefined,
+        landingHostname: landingHostname || undefined,
         landingReferrer: landingReferrer || undefined,
       };
     }
@@ -699,17 +884,87 @@
       return consentState.analytics !== 'denied';
     }
 
-    function createEvent(type, payload) {
+    function createEvent(type, payload, pageId) {
       ensureVisitor();
       ensureSession();
-      return {
-        clientEventId: randomId(20),
+      ensureTab();
+      if (!isCodecId(pageViewId) && type !== 'page_view' && !pageId) {
+        sendPageView();
+      }
+      var viewId = pageId || pageViewId;
+      var event = {
+        clientEventId: mintId(),
+        visitorId: visitorId,
+        sessionId: sessionId,
         sequence: nextSequence(),
-        pageViewId: pageViewId,
+        pageViewId: viewId,
+        tabId: tabId,
+        sessionStartedTs: sessionStartedTs,
         type: type,
         occurredAtMs: now(),
         payload: payload || {},
+        eventRevision: 1,
+        eventFinal: snapshotType(type) ? 0 : 1,
       };
+      if (isCodecId(previousPageViewId)) {
+        event.previousPageViewId = previousPageViewId;
+      }
+      applyPageSnapshot(event, pageSnapshots[viewId]);
+      return event;
+    }
+
+    function snapshotType(type) {
+      return type === 'page_performance' || type === 'resource_summary' || type === 'page_engagement';
+    }
+
+    function applyPageSnapshot(event, snap) {
+      if (!snap) {
+        return;
+      }
+      event.pageViewStartedTs = snap.startedTs;
+      event.pageViewIndex = snap.index;
+      event.previousPageViewId = snap.previousPageViewId || event.previousPageViewId;
+      if (snap.rqcid && !event.payload.rqcid) {
+        event.payload.rqcid = snap.rqcid;
+      }
+      if (snap.page && !event.payload.page) {
+        event.payload.page = snap.page;
+      }
+      if (snap.viewport && !event.payload.viewport) {
+        event.payload.viewport = snap.viewport;
+      }
+      if (snap.attribution && !event.payload.attribution) {
+        event.payload.attribution = snap.attribution;
+      }
+      if (snap.query && !event.payload.query) {
+        event.payload.query = snap.query;
+      }
+    }
+
+    function nextRevision(pageId, type) {
+      var key = pageId + ':' + type;
+      snapshotRevisions[key] = (snapshotRevisions[key] || 0) + 1;
+      return snapshotRevisions[key];
+    }
+
+    function emitSnapshot(type, pageId, payload, isFinal, trigger) {
+      if (!pageId) {
+        return null;
+      }
+      var event = createEvent(type, payload, pageId);
+      event.eventRevision = nextRevision(pageId, type);
+      event.eventFinal = isFinal ? 1 : 0;
+      if (trigger) {
+        event.engagementTrigger = trigger;
+        if (type === 'page_engagement' && event.payload) {
+          event.payload.engagementTrigger = trigger;
+        }
+      }
+      enqueue(event);
+      if (isFinal) {
+        lastFinalEventIds.push(event.clientEventId);
+      }
+      return event;
     }
 
     function estimateSize(item) {
@@ -731,8 +986,35 @@
       }
     }
 
-    function idbPut(event) {
+    function idbBind(db) {
+      if (!db) {
+        return;
+      }
+      idbDb = db;
+      try {
+        db.onclose = function () {
+          if (idbDb === db) {
+            idbDb = null;
+          }
+        };
+        db.onversionchange = function () {
+          try {
+            db.close();
+          } catch (e) {}
+          if (idbDb === db) {
+            idbDb = null;
+          }
+        };
+      } catch (e) {}
+    }
+
+    function idbEnsure(cb) {
       if (!idbAvailable) {
+        cb(null);
+        return;
+      }
+      if (idbDb) {
+        cb(idbDb);
         return;
       }
       try {
@@ -744,42 +1026,61 @@
           }
         };
         req.onsuccess = function (e) {
-          try {
-            var db = e.target.result;
-            var tx = db.transaction(IDB_STORE, 'readwrite');
-            tx.objectStore(IDB_STORE).put({
-              clientEventId: event.clientEventId,
-              occurredAtMs: event.occurredAtMs,
-              event: event,
-            });
-          } catch (err) {}
+          idbBind(e.target.result);
+          cb(idbDb);
         };
         req.onerror = function () {
           idbAvailable = false;
+          idbDb = null;
+          cb(null);
         };
       } catch (e) {
         idbAvailable = false;
+        idbDb = null;
+        cb(null);
       }
+    }
+
+    function idbPut(event) {
+      if (!idbAvailable || !event) {
+        return;
+      }
+      idbEnsure(function (db) {
+        if (!db) {
+          return;
+        }
+        try {
+          var tx = db.transaction(IDB_STORE, 'readwrite');
+          tx.objectStore(IDB_STORE).put({
+            clientEventId: event.clientEventId,
+            occurredAtMs: event.occurredAtMs,
+            event: event,
+          });
+        } catch (err) {
+          idbDb = null;
+        }
+      });
     }
 
     function idbDelete(ids) {
       if (!idbAvailable || !ids || !ids.length) {
         return;
       }
-      try {
-        var req = window.indexedDB.open(IDB_NAME, IDB_VERSION);
-        req.onsuccess = function (e) {
-          try {
-            var db = e.target.result;
-            var tx = db.transaction(IDB_STORE, 'readwrite');
-            var store = tx.objectStore(IDB_STORE);
-            var i;
-            for (i = 0; i < ids.length; i++) {
-              store.delete(ids[i]);
-            }
-          } catch (err) {}
-        };
-      } catch (e) {}
+      idbEnsure(function (db) {
+        if (!db) {
+          return;
+        }
+        try {
+          var tx = db.transaction(IDB_STORE, 'readwrite');
+          var store = tx.objectStore(IDB_STORE);
+          var i;
+          for (i = 0; i < ids.length; i++) {
+            store.delete(ids[i]);
+          }
+        } catch (err) {
+          idbDb = null;
+        }
+      });
     }
 
     function idbRestore(done) {
@@ -787,47 +1088,47 @@
         done();
         return;
       }
-      try {
-        var req = window.indexedDB.open(IDB_NAME, IDB_VERSION);
-        req.onupgradeneeded = function (e) {
-          var db = e.target.result;
-          if (!db.objectStoreNames.contains(IDB_STORE)) {
-            db.createObjectStore(IDB_STORE, { keyPath: 'clientEventId' });
-          }
-        };
-        req.onsuccess = function (e) {
-          try {
-            var db = e.target.result;
-            var tx = db.transaction(IDB_STORE, 'readonly');
-            var getAll = tx.objectStore(IDB_STORE).getAll();
-            getAll.onsuccess = function () {
-              var rows = getAll.result || [];
-              var seen = {};
-              var i;
-              for (i = 0; i < memoryQueue.length; i++) {
-                seen[memoryQueue[i].clientEventId] = 1;
-              }
-              for (i = 0; i < rows.length; i++) {
-                if (rows[i] && rows[i].event && !seen[rows[i].clientEventId]) {
-                  memoryQueue.push(rows[i].event);
-                }
-              }
-              trimQueue();
-              done();
-            };
-            getAll.onerror = done;
-          } catch (err) {
-            done();
-          }
-        };
-        req.onerror = function () {
-          idbAvailable = false;
+      idbEnsure(function (db) {
+        if (!db) {
           done();
-        };
-      } catch (e) {
-        idbAvailable = false;
-        done();
-      }
+          return;
+        }
+        try {
+          var tx = db.transaction(IDB_STORE, 'readonly');
+          var getAll = tx.objectStore(IDB_STORE).getAll();
+          getAll.onsuccess = function () {
+            var rows = getAll.result || [];
+            var seen = {};
+            var i;
+            for (i = 0; i < memoryQueue.length; i++) {
+              seen[memoryQueue[i].clientEventId] = 1;
+            }
+            var invalidIds = [];
+            for (i = 0; i < rows.length; i++) {
+              var restored = rows[i] && rows[i].event;
+              if (!restored || seen[rows[i].clientEventId]) {
+                continue;
+              }
+              if (!isCodecId(restored.visitorId) || !isCodecId(restored.sessionId)) {
+                invalidIds.push(rows[i].clientEventId);
+                diagnostics.invalidIdbEvents += 1;
+                continue;
+              }
+              restored.fromIndexedDb = 1;
+              memoryQueue.push(restored);
+            }
+            if (invalidIds.length) {
+              idbDelete(invalidIds);
+            }
+            trimQueue();
+            done();
+          };
+          getAll.onerror = done;
+        } catch (err) {
+          idbDb = null;
+          done();
+        }
+      });
     }
 
     function enqueue(event) {
@@ -873,17 +1174,95 @@
       }, delay);
     }
 
-    function buildBatch(events) {
-      ensureVisitor();
-      ensureSession();
+    function eventSignature(events) {
+      var parts = [];
+      var i;
+      for (i = 0; i < events.length; i++) {
+        parts.push(events[i].clientEventId);
+      }
+      return parts.join(',');
+    }
+
+    function stampBatch(events) {
+      var signature = eventSignature(events);
+      var id = events.length ? events[0].deliveryBatchId : '';
+      var same = isCodecId(id);
+      var i;
+      for (i = 0; i < events.length; i++) {
+        if (events[i].deliveryBatchId !== id || events[i].deliverySignature !== signature) {
+          same = false;
+        }
+      }
+      if (!same) {
+        id = mintId();
+        for (i = 0; i < events.length; i++) {
+          events[i].deliveryBatchId = id;
+          events[i].deliverySignature = signature;
+          idbPut(events[i]);
+        }
+      }
+      return id;
+    }
+
+    function wireEvent(event) {
+      var copy = {
+        clientEventId: event.clientEventId,
+        sequence: event.sequence,
+        pageViewId: event.pageViewId,
+        tabId: event.tabId,
+        sessionStartedTs: event.sessionStartedTs,
+        pageViewStartedTs: event.pageViewStartedTs,
+        pageViewIndex: event.pageViewIndex,
+        eventRevision: event.eventRevision,
+        eventFinal: event.eventFinal,
+        type: event.type,
+        occurredAtMs: event.occurredAtMs,
+        payload: event.payload || {},
+      };
+      if (event.previousPageViewId) {
+        copy.previousPageViewId = event.previousPageViewId;
+      }
+      if (event.engagementTrigger) {
+        copy.engagementTrigger = event.engagementTrigger;
+      }
+      if (event.deliveryTransport) {
+        copy.delivery = {
+          transport: event.deliveryTransport,
+          attempt: event.deliveryAttempt || 1,
+          fromIndexeddb: event.deliveryFromIndexeddb ? 1 : 0,
+          finalFlush: event.deliveryFinalFlush ? 1 : 0,
+        };
+      }
+      return copy;
+    }
+
+    function buildBatch(events, batchId) {
+      if (!events || !events.length) {
+        return null;
+      }
+      var batchVisitorId = events[0].visitorId;
+      var batchSessionId = events[0].sessionId;
+      if (!isCodecId(batchVisitorId) || !isCodecId(batchSessionId)) {
+        return null;
+      }
+      var wire = [];
+      var i;
+      for (i = 0; i < events.length; i++) {
+        if (events[i].visitorId !== batchVisitorId || events[i].sessionId !== batchSessionId) {
+          return null;
+        }
+        wire.push(wireEvent(events[i]));
+      }
       return {
         schemaVersion: SCHEMA_VERSION,
         sdkVersion: SDK_VERSION,
         siteKey: siteKey,
         script_id: siteKey,
         site_id: siteKey,
-        visitorId: visitorId,
-        sessionId: sessionId,
+        sdkIntegrationMode: 'script',
+        visitorId: batchVisitorId,
+        sessionId: batchSessionId,
+        batchId: batchId,
         sentAtMs: now(),
         context: {
           browser: collectBrowser(),
@@ -893,23 +1272,97 @@
           network: collectNetwork(),
           privacy: collectPrivacy(),
         },
-        events: events,
+        events: wire,
       };
     }
 
-    function takeBatch() {
+    function hasIdentity(event) {
+      return !!(event && isCodecId(event.visitorId) && isCodecId(event.sessionId));
+    }
+
+    function takeBatch(options) {
+      options = options || {};
+      var maxBytes = options.maxBytes != null ? options.maxBytes : MAX_BATCH_BYTES;
+      var maxEvents = options.maxEvents != null ? options.maxEvents : MAX_EVENTS_PER_BATCH;
+      var priorityIds = options.priorityIds;
+      var priority = [];
+      var rest = [];
+      var invalid = [];
+      var i;
+      if (priorityIds && priorityIds.length) {
+        var set = {};
+        for (i = 0; i < priorityIds.length; i++) {
+          set[priorityIds[i]] = 1;
+        }
+        for (i = 0; i < memoryQueue.length; i++) {
+          if (set[memoryQueue[i].clientEventId]) {
+            priority.push(memoryQueue[i]);
+          } else {
+            rest.push(memoryQueue[i]);
+          }
+        }
+      } else {
+        rest = memoryQueue.slice();
+      }
       var events = [];
       var size = 256;
-      while (memoryQueue.length && events.length < MAX_EVENTS_PER_BATCH) {
-        var next = memoryQueue[0];
-        var nextSize = estimateSize(next);
-        if (events.length && size + nextSize > MAX_BATCH_BYTES) {
-          break;
+      var batchVisitorId = '';
+      var batchSessionId = '';
+      function pull(list) {
+        var kept = [];
+        var j;
+        var stopped = false;
+        for (j = 0; j < list.length; j++) {
+          var next = list[j];
+          if (stopped) {
+            kept.push(next);
+            continue;
+          }
+          if (!hasIdentity(next)) {
+            invalid.push(next);
+            continue;
+          }
+          if (events.length && (next.visitorId !== batchVisitorId || next.sessionId !== batchSessionId)) {
+            kept.push(next);
+            continue;
+          }
+          var nextSize = estimateSize(next);
+          if (events.length >= maxEvents || (events.length && size + nextSize > maxBytes)) {
+            stopped = true;
+            kept.push(next);
+            continue;
+          }
+          if (!events.length) {
+            batchVisitorId = next.visitorId;
+            batchSessionId = next.sessionId;
+          }
+          events.push(next);
+          size += nextSize;
         }
-        events.push(memoryQueue.shift());
-        size += nextSize;
+        return kept;
+      }
+      var leftPriority = pull(priority);
+      var leftRest = pull(rest);
+      memoryQueue = leftPriority.concat(leftRest);
+      if (invalid.length) {
+        var dropIds = [];
+        for (i = 0; i < invalid.length; i++) {
+          dropIds.push(invalid[i].clientEventId);
+          diagnostics.invalidIdbEvents += 1;
+        }
+        idbDelete(dropIds);
       }
       return events;
+    }
+
+    function stampDelivery(events, transport, finalFlush) {
+      var i;
+      for (i = 0; i < events.length; i++) {
+        events[i].deliveryAttempt = (events[i].deliveryAttempt || 0) + 1;
+        events[i].deliveryTransport = transport;
+        events[i].deliveryFinalFlush = finalFlush ? 1 : 0;
+        events[i].deliveryFromIndexeddb = events[i].fromIndexedDb ? 1 : 0;
+      }
     }
 
     function restoreBatch(events) {
@@ -921,17 +1374,25 @@
       return round(exp / 2 + Math.random() * exp / 2);
     }
 
-    function postJson(body, onDone) {
+    function postJson(body, onDone, keepalive) {
       if (typeof window.fetch === 'function') {
+        var init = {
+          method: 'POST',
+          body: body,
+          credentials: 'omit',
+          mode: 'cors',
+        };
+        if (keepalive) {
+          init.keepalive = true;
+        }
         window
-          .fetch(EVENTS_URL, {
-            method: 'POST',
-            body: body,
-            credentials: 'omit',
-            mode: 'cors',
-          })
+          .fetch(EVENTS_URL, init)
           .then(function (res) {
-            onDone(null, res);
+            return res.text().then(function (text) {
+              onDone(null, res, text);
+            }, function () {
+              onDone(null, res, '');
+            });
           })
           .catch(function (err) {
             onDone(err);
@@ -943,7 +1404,11 @@
         xhr.open('POST', EVENTS_URL, true);
         xhr.setRequestHeader('Content-Type', 'text/plain;charset=UTF-8');
         xhr.onload = function () {
-          onDone(null, { ok: xhr.status >= 200 && xhr.status < 300, status: xhr.status, headers: { get: function () { return xhr.getResponseHeader('Retry-After'); } } });
+          onDone(null, {
+            ok: xhr.status >= 200 && xhr.status < 300,
+            status: xhr.status,
+            headers: { get: function () { return xhr.getResponseHeader('Retry-After'); } },
+          }, xhr.responseText || '');
         };
         xhr.onerror = function () {
           onDone(new Error('network'));
@@ -954,49 +1419,161 @@
       }
     }
 
+    function parseAckBody(text) {
+      if (!text || typeof text !== 'string') {
+        return null;
+      }
+      try {
+        var body = JSON.parse(text);
+        if (!body || typeof body !== 'object') {
+          return null;
+        }
+        if (!isArray(body.accepted) && !isArray(body.rejected)) {
+          return null;
+        }
+        return {
+          accepted: isArray(body.accepted) ? body.accepted : [],
+          rejected: isArray(body.rejected) ? body.rejected : [],
+        };
+      } catch (e) {
+        return null;
+      }
+    }
+
+    function buildAckMaps(events) {
+      var byDotted = {};
+      var byServer = {};
+      var i;
+      for (i = 0; i < events.length; i++) {
+        var event = events[i];
+        byDotted[event.clientEventId] = event;
+        var serverId = codecIdToServerIdString(event.clientEventId);
+        if (serverId) {
+          byServer[serverId] = event;
+        }
+      }
+      return { byDotted: byDotted, byServer: byServer };
+    }
+
+    function lookupAckEvent(maps, id) {
+      if (id == null) {
+        return null;
+      }
+      var key = String(id);
+      return maps.byDotted[key] || maps.byServer[key] || null;
+    }
+
+    function reconcileAck(events, ack) {
+      var maps = buildAckMaps(events);
+      var remove = {};
+      var keep = [];
+      var i;
+      for (i = 0; i < ack.accepted.length; i++) {
+        var acceptedEvent = lookupAckEvent(maps, ack.accepted[i]);
+        if (acceptedEvent) {
+          remove[acceptedEvent.clientEventId] = 1;
+        }
+      }
+      for (i = 0; i < ack.rejected.length; i++) {
+        var item = ack.rejected[i] || {};
+        var rejectedId = item.clientEventId != null ? item.clientEventId : item.client_event_id;
+        var rejectedEvent = lookupAckEvent(maps, rejectedId);
+        if (rejectedEvent) {
+          remove[rejectedEvent.clientEventId] = 1;
+          diagnostics.rejectedEvents += 1;
+          diagnostics.lastRejectReason = item.reason ? String(item.reason) : 'rejected';
+        }
+      }
+      var removedIds = [];
+      for (i = 0; i < events.length; i++) {
+        if (remove[events[i].clientEventId]) {
+          removedIds.push(events[i].clientEventId);
+        } else {
+          keep.push(events[i]);
+        }
+      }
+      return { removedIds: removedIds, keep: keep };
+    }
+
     function flush(useBeacon) {
-      if (inflight || !siteKey || !memoryQueue.length || !analyticsAllowed()) {
+      if (!siteKey || !memoryQueue.length || !analyticsAllowed()) {
         return;
       }
-      var events = takeBatch();
+      if (!useBeacon && inflight) {
+        return;
+      }
+      var events = useBeacon
+        ? takeBatch({
+            priorityIds: lastFinalEventIds,
+            maxBytes: MAX_BEACON_BYTES,
+            maxEvents: MAX_EVENTS_PER_BATCH,
+          })
+        : takeBatch();
       if (!events.length) {
         return;
       }
-      var batch = buildBatch(events);
+      stampDelivery(events, useBeacon ? 'beacon' : 'fetch', !!useBeacon);
+      var batch = buildBatch(events, stampBatch(events));
       var body;
       try {
-        body = JSON.stringify(batch);
+        body = batch ? JSON.stringify(batch) : '';
       } catch (e) {
+        body = '';
+      }
+      if (!batch || !body) {
         restoreBatch(events);
         return;
       }
       if (useBeacon) {
+        var acceptedByBrowser = false;
         try {
           if (navigator.sendBeacon && body.length <= MAX_BEACON_BYTES) {
-            navigator.sendBeacon(EVENTS_URL, new Blob([body], { type: 'text/plain;charset=UTF-8' }));
+            acceptedByBrowser = !!navigator.sendBeacon(
+              EVENTS_URL,
+              new Blob([body], { type: 'text/plain;charset=UTF-8' })
+            );
           }
-        } catch (e) {}
+        } catch (e) {
+          acceptedByBrowser = false;
+        }
+        if (!acceptedByBrowser && typeof window.fetch === 'function') {
+          try {
+            diagnostics.keepaliveAttempts += 1;
+            postJson(body, function () {}, true);
+          } catch (e2) {}
+        }
         restoreBatch(events);
         scheduleFlush();
         return;
       }
       inflight = true;
-      postJson(body, isolate(function (err, res) {
+      postJson(body, isolate(function (err, res, text) {
         inflight = false;
+        var status = res && res.status;
         if (!err && res && res.ok) {
-          retryAttempt = 0;
-          var ids = [];
-          var i;
-          for (i = 0; i < events.length; i++) {
-            ids.push(events[i].clientEventId);
+          var ack = parseAckBody(text);
+          if (!ack) {
+            restoreBatch(events);
+            retryAttempt += 1;
+            retryTimer = setTimeout(function () {
+              retryTimer = 0;
+              flush(false);
+            }, backoffMs(Math.min(retryAttempt, 5)));
+            return;
           }
-          idbDelete(ids);
+          retryAttempt = 0;
+          var result = reconcileAck(events, ack);
+          if (result.removedIds.length) {
+            idbDelete(result.removedIds);
+          }
+          if (result.keep.length) {
+            restoreBatch(result.keep);
+          }
           if (memoryQueue.length) {
             scheduleFlush();
           }
           return;
         }
-        var status = res && res.status;
         if (status && status >= 400 && status < 500 && status !== 429) {
           var drop = [];
           var d;
@@ -1055,8 +1632,10 @@
       scrollMilestones = {};
       scrollTimes = {};
       lastScrollY = window.scrollY || 0;
-      engagementSentFor = '';
       vitals = {};
+      if (clsObserved) {
+        vitals.cls = 0;
+      }
     }
 
     function isActive() {
@@ -1092,24 +1671,36 @@
     function engagementPayload() {
       tickEngagement();
       return {
-        totalDurationMs: round(perfNow() - pageStartedAt),
-        visibleDurationMs: round(visibleAccum),
-        activeDurationMs: round(activeAccum),
-        timeToFirstInteractionMs: firstInteractionMs || undefined,
-        clickCount: clickCount,
-        scrollCount: scrollCount,
-        maxScrollDepth: maxScrollDepth,
+        totalDurationMs: toInteger(perfNow() - pageStartedAt),
+        visibleDurationMs: toInteger(visibleAccum),
+        activeDurationMs: toInteger(activeAccum),
+        timeToFirstInteractionMs: firstInteractionMs ? toInteger(firstInteractionMs) : undefined,
+        clickCount: toInteger(clickCount),
+        scrollCount: toInteger(scrollCount),
+        maxScrollDepth: keepNumber(maxScrollDepth / 100),
       };
     }
 
-    function finalizePage() {
-      if (!pageViewId || engagementSentFor === pageViewId) {
+    function snapshotPage(trigger) {
+      if (!pageViewId) {
         return;
       }
-      engagementSentFor = pageViewId;
-      emit('page_engagement', engagementPayload());
-      emitPagePerformance();
-      emitResourceSummary();
+      var pageId = pageViewId;
+      emitSnapshot('page_engagement', pageId, engagementPayload(), false, trigger);
+      emitSnapshot('page_performance', pageId, performancePayload(), false, trigger);
+      emitSnapshot('resource_summary', pageId, resourceSummaryPayload(), false, trigger);
+    }
+
+    function finalizePage(trigger) {
+      if (!pageViewId || finalizedPageViewId === pageViewId) {
+        return;
+      }
+      var pageId = pageViewId;
+      finalizedPageViewId = pageId;
+      lastFinalEventIds = [];
+      emitSnapshot('page_engagement', pageId, engagementPayload(), true, trigger || 'final');
+      emitSnapshot('page_performance', pageId, performancePayload(), true, trigger || 'final');
+      emitSnapshot('resource_summary', pageId, resourceSummaryPayload(), true, trigger || 'final');
     }
 
     function sendPageView() {
@@ -1121,20 +1712,44 @@
         return;
       }
       if (lastPageViewUrl) {
-        finalizePage();
+        finalizePage('spa_navigation');
       }
       lastPageViewUrl = key;
-      pageViewId = randomId(16);
+      if (isCodecId(pageViewId)) {
+        previousPageViewId = pageViewId;
+      } else {
+        var storedPrev = readStorage(window.sessionStorage, LAST_PVID_KEY);
+        previousPageViewId = isCodecId(storedPrev) ? storedPrev : '';
+      }
+      pageViewId = mintId();
+      writeStorage(window.sessionStorage, pageViewId, LAST_PVID_KEY);
       resetPageState();
       captureAttribution();
-      emit('page_view', {
+      var index = (parseInt(readStorage(window.sessionStorage, PVI_KEY), 10) || 0) + 1;
+      writeStorage(window.sessionStorage, String(index), PVI_KEY);
+      pageSnapshots[pageViewId] = {
+        pageViewId: pageViewId,
+        previousPageViewId: previousPageViewId && previousPageViewId !== pageViewId ? previousPageViewId : '',
+        startedTs: now(),
+        index: index,
+        rqcid: stored,
         page: collectPage(),
+        viewport: collectDevice(),
         query: allowedQuery(),
         attribution: attributionPayload(),
+      };
+      emit('page_view', {
+        page: pageSnapshots[pageViewId].page,
+        query: pageSnapshots[pageViewId].query,
+        attribution: pageSnapshots[pageViewId].attribution,
       });
+      var capturedPageId = pageViewId;
       whenIdle(function () {
-        emitPagePerformance();
-        emitResourceSummary();
+        if (pageViewId !== capturedPageId || !pageSnapshots[capturedPageId]) {
+          return;
+        }
+        emitSnapshot('page_performance', capturedPageId, performancePayload(), false, 'periodic');
+        emitSnapshot('resource_summary', capturedPageId, resourceSummaryPayload(), false, 'periodic');
       }, 3000);
     }
 
@@ -1149,20 +1764,21 @@
         if (n) {
           return {
             navigationType: n.type,
-            redirectCount: n.redirectCount,
-            redirectMs: round(n.redirectEnd - n.redirectStart),
-            dnsMs: round(n.domainLookupEnd - n.domainLookupStart),
-            tcpMs: round(n.connectEnd - n.connectStart),
-            tlsMs: n.secureConnectionStart ? round(n.connectEnd - n.secureConnectionStart) : 0,
-            ttfbMs: round(n.responseStart - n.requestStart),
-            responseMs: round(n.responseEnd - n.responseStart),
-            domInteractiveMs: round(n.domInteractive),
-            domContentLoadedMs: round(n.domContentLoadedEventEnd),
-            loadMs: round(n.loadEventEnd),
+            redirectCount: toInteger(n.redirectCount),
+            redirectMs: toInteger(n.redirectEnd - n.redirectStart),
+            dnsMs: toInteger(n.domainLookupEnd - n.domainLookupStart),
+            tcpMs: toInteger(n.connectEnd - n.connectStart),
+            tlsMs: n.secureConnectionStart ? toInteger(n.connectEnd - n.secureConnectionStart) : 0,
+            ttfbMs: toInteger(n.responseStart - n.requestStart),
+            responseMs: toInteger(n.responseEnd - n.responseStart),
+            domInteractiveMs: toInteger(n.domInteractive),
+            domContentLoadedMs: toInteger(n.domContentLoadedEventEnd),
+            loadMs: toInteger(n.loadEventEnd),
             nextHopProtocol: n.nextHopProtocol,
-            transferSize: n.transferSize,
-            encodedBodySize: n.encodedBodySize,
-            decodedBodySize: n.decodedBodySize,
+            transferSize: toInteger(n.transferSize),
+            encodedBodySize: toInteger(n.encodedBodySize),
+            decodedBodySize: toInteger(n.decodedBodySize),
+            timeOriginTs: timeOrigin(),
           };
         }
         var t = perf.timing;
@@ -1172,35 +1788,45 @@
         var start = t.navigationStart;
         return {
           navigationType: perf.navigation ? ['navigate', 'reload', 'back_forward'][perf.navigation.type] : undefined,
-          redirectCount: perf.navigation ? perf.navigation.redirectCount : undefined,
-          redirectMs: t.redirectEnd - t.redirectStart,
-          dnsMs: t.domainLookupEnd - t.domainLookupStart,
-          tcpMs: t.connectEnd - t.connectStart,
-          tlsMs: t.secureConnectionStart ? t.connectEnd - t.secureConnectionStart : 0,
-          ttfbMs: t.responseStart - t.requestStart,
-          responseMs: t.responseEnd - t.responseStart,
-          domInteractiveMs: t.domInteractive - start,
-          domContentLoadedMs: t.domContentLoadedEventEnd - start,
-          loadMs: t.loadEventEnd - start,
+          redirectCount: perf.navigation ? toInteger(perf.navigation.redirectCount) : undefined,
+          redirectMs: toInteger(t.redirectEnd - t.redirectStart),
+          dnsMs: toInteger(t.domainLookupEnd - t.domainLookupStart),
+          tcpMs: toInteger(t.connectEnd - t.connectStart),
+          tlsMs: t.secureConnectionStart ? toInteger(t.connectEnd - t.secureConnectionStart) : 0,
+          ttfbMs: toInteger(t.responseStart - t.requestStart),
+          responseMs: toInteger(t.responseEnd - t.responseStart),
+          domInteractiveMs: toInteger(t.domInteractive - start),
+          domContentLoadedMs: toInteger(t.domContentLoadedEventEnd - start),
+          loadMs: toInteger(t.loadEventEnd - start),
+          timeOriginTs: timeOrigin(),
         };
       } catch (e) {
         return null;
       }
     }
 
-    function emitPagePerformance() {
-      var timing = navTiming();
-      emit('page_performance', {
-        navigation: timing || undefined,
-        webVitals: vitals,
-      });
+    function timeOrigin() {
+      try {
+        if (window.performance && typeof window.performance.timeOrigin === 'number' && window.performance.timeOrigin > 0) {
+          return round(window.performance.timeOrigin);
+        }
+      } catch (e) {}
+      return 0;
     }
 
-    function emitResourceSummary() {
+    function performancePayload() {
+      var timing = navTiming();
+      return {
+        navigation: timing || undefined,
+        webVitals: vitals,
+      };
+    }
+
+    function resourceSummaryPayload() {
       try {
         var perf = window.performance;
         if (!perf || !perf.getEntriesByType) {
-          return;
+          return {};
         }
         var list = perf.getEntriesByType('resource') || [];
         var i;
@@ -1227,16 +1853,22 @@
           else if (type === 'font') summary.fontCount += 1;
           else if (type === 'video' || type === 'audio') summary.mediaCount += 1;
           if (item.transferSize) summary.transferBytes += item.transferSize;
-          if (item.duration > summary.slowestResourceMs) summary.slowestResourceMs = round(item.duration);
+          if (item.duration > summary.slowestResourceMs) summary.slowestResourceMs = toInteger(item.duration) || 0;
         }
-        emit('resource_summary', summary);
-      } catch (e) {}
+        summary.resourceCount = toInteger(summary.resourceCount) || 0;
+        summary.transferBytes = toInteger(summary.transferBytes) || 0;
+        return summary;
+      } catch (e) {
+        return {};
+      }
     }
 
     function observeVitals() {
       if (!window.PerformanceObserver) {
         return;
       }
+      vitals.cls = 0;
+      clsObserved = true;
       function observe(type, fn) {
         try {
           var obs = new window.PerformanceObserver(isolate(function (list) {
@@ -1277,31 +1909,39 @@
       });
     }
 
-    function targetMeta(node) {
+    function targetMeta(node, link) {
       if (!node || !node.getAttribute) {
         return null;
       }
-      var hrefPath;
-      try {
-        if (node.href) {
-          hrefPath = new URL(node.href, window.location.href).pathname;
-        }
-      } catch (e) {}
       var rect = null;
       try {
         if (node.getBoundingClientRect) {
           rect = node.getBoundingClientRect();
         }
       } catch (e) {}
-      return {
+      var meta = {
         trackingId: node.getAttribute('data-refiq-id') || undefined,
         id: node.id || undefined,
         tag: node.tagName || undefined,
         role: node.getAttribute('role') || undefined,
-        hrefPath: hrefPath,
-        width: rect ? round(rect.width) : undefined,
-        height: rect ? round(rect.height) : undefined,
+        width: rect ? keepNumber(rect.width) : undefined,
+        height: rect ? keepNumber(rect.height) : undefined,
       };
+      var hrefNode = link && link.href ? link : node.href ? node : null;
+      if (hrefNode && hrefNode.href) {
+        try {
+          var url = new URL(hrefNode.href, window.location.href);
+          if (url.protocol === 'http:' || url.protocol === 'https:') {
+            meta.hrefPath = url.pathname;
+            meta.hrefPathname = url.pathname;
+            meta.hrefOrigin = url.origin;
+            meta.hrefHostname = url.hostname;
+            meta.isExternal = url.origin !== window.location.origin;
+            meta.href = url.origin + url.pathname;
+          }
+        } catch (e2) {}
+      }
+      return meta;
     }
 
     function onClick(event) {
@@ -1316,30 +1956,43 @@
       }
       markInteraction();
       clickCount += 1;
+      var clickNode = node && (node.nodeType === 1 || node.tagName) ? node : node && node.parentElement;
       var rect = null;
       try {
-        if (node && node.getBoundingClientRect) {
-          rect = node.getBoundingClientRect();
+        if (clickNode && clickNode.getBoundingClientRect) {
+          rect = clickNode.getBoundingClientRect();
         }
       } catch (e) {}
+      var viewportWidth = window.innerWidth || 0;
+      var viewportHeight = window.innerHeight || 0;
+      var documentWidth = document.documentElement ? document.documentElement.scrollWidth : 0;
+      var documentHeight = document.documentElement ? document.documentElement.scrollHeight : 0;
+      var relativeX = rect ? keepNumber(event.clientX - rect.left) : undefined;
+      var relativeY = rect ? keepNumber(event.clientY - rect.top) : undefined;
       var payload = {
-        clientX: event.clientX,
-        clientY: event.clientY,
-        pageX: event.pageX,
-        pageY: event.pageY,
-        relativeX: rect ? event.clientX - rect.left : undefined,
-        relativeY: rect ? event.clientY - rect.top : undefined,
-        button: event.button,
+        clientX: toInteger(event.clientX),
+        clientY: toInteger(event.clientY),
+        pageX: toInteger(event.pageX),
+        pageY: toInteger(event.pageY),
+        relativeX: relativeX,
+        relativeY: relativeY,
+        clickTargetX: relativeX != null ? relativeX : -1,
+        clickTargetY: relativeY != null ? relativeY : -1,
+        clickViewportXRatio: ratio(event.clientX, viewportWidth),
+        clickViewportYRatio: ratio(event.clientY, viewportHeight),
+        clickDocumentXRatio: ratio(event.pageX, documentWidth),
+        clickDocumentYRatio: ratio(event.pageY, documentHeight),
+        button: toInteger(event.button),
         pointerType: event.pointerType,
         ctrlKey: !!event.ctrlKey,
         shiftKey: !!event.shiftKey,
         altKey: !!event.altKey,
         metaKey: !!event.metaKey,
-        target: targetMeta(node && (node.nodeType === 1 || node.tagName) ? node : node && node.parentElement),
+        target: targetMeta(clickNode, link && link.nodeName === 'A' ? link : null),
       };
-      if (typeof event.pressure === 'number') payload.pressure = event.pressure;
-      if (typeof event.width === 'number') payload.width = event.width;
-      if (typeof event.height === 'number') payload.height = event.height;
+      if (typeof event.pressure === 'number') payload.pressure = keepNumber(event.pressure);
+      if (typeof event.width === 'number') payload.width = keepNumber(event.width);
+      if (typeof event.height === 'number') payload.height = keepNumber(event.height);
       if (typeof event.isPrimary === 'boolean') payload.isPrimary = event.isPrimary;
       emit('click', payload);
     }
@@ -1358,7 +2011,7 @@
       } catch (e) {}
       emit('form_submit', {
         formId: (form.getAttribute && (form.getAttribute('data-refiq-id') || form.id)) || undefined,
-        fieldCount: fields,
+        fieldCount: toInteger(fields),
         valid: form.checkValidity ? !!form.checkValidity() : undefined,
         method: (form.method || 'get').toLowerCase(),
       });
@@ -1367,40 +2020,45 @@
     function measureScroll() {
       var el = document.documentElement;
       var body = document.body;
-      var scrollY = window.scrollY || (el && el.scrollTop) || 0;
-      var scrollX = window.scrollX || (el && el.scrollLeft) || 0;
-      var viewportHeight = window.innerHeight || (el && el.clientHeight) || 0;
-      var documentHeight = Math.max(
+      var rawScrollY = window.scrollY || (el && el.scrollTop) || 0;
+      var rawScrollX = window.scrollX || (el && el.scrollLeft) || 0;
+      var scrollY = toInteger(rawScrollY) || 0;
+      var scrollX = toInteger(rawScrollX) || 0;
+      var viewportHeight = toInteger(window.innerHeight || (el && el.clientHeight) || 0) || 0;
+      var documentHeight = toInteger(Math.max(
         el ? el.scrollHeight : 0,
         body ? body.scrollHeight : 0,
         el ? el.offsetHeight : 0
-      );
-      var depth = documentHeight ? Math.min(100, round(((scrollY + viewportHeight) / documentHeight) * 100)) : 0;
-      if (depth > maxScrollDepth) {
-        maxScrollDepth = depth;
+      )) || 0;
+      var depthPct = documentHeight ? Math.min(100, ((scrollY + viewportHeight) / documentHeight) * 100) : 0;
+      var depth = keepNumber(depthPct / 100);
+      if (depthPct > maxScrollDepth) {
+        maxScrollDepth = depthPct;
       }
-      var direction = scrollY > lastScrollY ? 'down' : scrollY < lastScrollY ? 'up' : 'none';
-      lastScrollY = scrollY;
+      var direction = rawScrollY > lastScrollY ? 'down' : rawScrollY < lastScrollY ? 'up' : 'none';
+      lastScrollY = rawScrollY;
       scrollCount += 1;
       var i;
       for (i = 0; i < SCROLL_MILESTONES.length; i++) {
         var mark = SCROLL_MILESTONES[i];
-        if (depth >= mark && !scrollMilestones[mark]) {
+        if (depthPct >= mark && !scrollMilestones[mark]) {
           scrollMilestones[mark] = 1;
-          scrollTimes['timeTo' + mark + 'Ms'] = round(perfNow() - pageStartedAt);
+          scrollTimes['timeTo' + mark + 'Ms'] = toInteger(perfNow() - pageStartedAt);
           var payload = {
             scrollX: scrollX,
             scrollY: scrollY,
             documentHeight: documentHeight,
             viewportHeight: viewportHeight,
             depth: depth,
-            maxDepth: maxScrollDepth,
+            maxDepth: keepNumber(maxScrollDepth / 100),
             direction: direction,
-            milestone: mark,
+            milestone: toInteger(mark),
+            scrollTimeToMilestone: toInteger(perfNow() - pageStartedAt),
             timeTo25Ms: scrollTimes.timeTo25Ms,
             timeTo50Ms: scrollTimes.timeTo50Ms,
             timeTo75Ms: scrollTimes.timeTo75Ms,
             timeTo90Ms: scrollTimes.timeTo90Ms,
+            timeTo100Ms: scrollTimes.timeTo100Ms,
           };
           emit('scroll', payload);
         }
@@ -1486,8 +2144,8 @@
         errorType: 'error',
         errorFingerprint: errorFingerprint('error', path, event.lineno, event.colno),
         scriptPath: path || undefined,
-        line: event.lineno,
-        column: event.colno,
+        line: toInteger(event.lineno),
+        column: toInteger(event.colno),
       });
     }
 
@@ -1501,20 +2159,23 @@
     function onVisibility() {
       tickEngagement();
       if (document.visibilityState === 'hidden') {
-        finalizePage();
+        snapshotPage('hidden');
         flush(true);
       } else {
         visibleOn = perfNow();
         if (isActive()) {
           activeOn = visibleOn;
         }
-        engagementSentFor = '';
       }
     }
 
-    function onPageHide() {
+    function onPageHide(event) {
       tickEngagement();
-      finalizePage();
+      if (event && event.persisted === true) {
+        snapshotPage('pagehide_bfcache');
+      } else {
+        finalizePage('pagehide');
+      }
       flush(true);
     }
 
@@ -1650,9 +2311,16 @@
         syncForms();
         sendPageView();
       }));
-      window.addEventListener('pageshow', isolate(function () {
+      window.addEventListener('pageshow', isolate(function (event) {
         capture();
         syncForms();
+        if (event && event.persisted === true) {
+          visibleOn = perfNow();
+          if (isActive()) {
+            activeOn = visibleOn;
+          }
+          return;
+        }
         tickEngagement();
       }));
       window.addEventListener('pagehide', isolate(onPageHide));
@@ -1741,6 +2409,8 @@
       consent: consent,
       push: push,
       l: 1,
+      _diagnostics: diagnostics,
+      _codecIdToServerIdString: codecIdToServerIdString,
     };
 
     capture();
