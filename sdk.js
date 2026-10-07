@@ -109,6 +109,7 @@
     var idbDb = null;
     var lastFinalEventIds = [];
     var finalizedPageViewId = '';
+    var backgroundSnapshotPageViewId = '';
     var diagnostics = { rejectedEvents: 0, lastRejectReason: '', keepaliveAttempts: 0, invalidIdbEvents: 0 };
     var consentState = { analytics: 'unknown', updatedAtMs: 0, policyVersion: '' };
     var landingPath = '';
@@ -951,6 +952,9 @@
       if (!pageId) {
         return null;
       }
+      if (!isFinal && finalizedPageViewId === pageId) {
+        return null;
+      }
       var event = createEvent(type, payload, pageId);
       event.eventRevision = nextRevision(pageId, type);
       event.eventFinal = isFinal ? 1 : 0;
@@ -1495,16 +1499,17 @@
       return { removedIds: removedIds, keep: keep };
     }
 
-    function flush(useBeacon) {
+    function flush(useBeacon, priorityIds) {
       if (!siteKey || !memoryQueue.length || !analyticsAllowed()) {
         return;
       }
       if (!useBeacon && inflight) {
         return;
       }
+      var effectivePriorityIds = priorityIds && priorityIds.length ? priorityIds : lastFinalEventIds;
       var events = useBeacon
         ? takeBatch({
-            priorityIds: lastFinalEventIds,
+            priorityIds: effectivePriorityIds,
             maxBytes: MAX_BEACON_BYTES,
             maxEvents: MAX_EVENTS_PER_BATCH,
           })
@@ -1632,6 +1637,7 @@
       scrollMilestones = {};
       scrollTimes = {};
       lastScrollY = window.scrollY || 0;
+      backgroundSnapshotPageViewId = '';
       vitals = {};
       if (clsObserved) {
         vitals.cls = 0;
@@ -1682,13 +1688,36 @@
     }
 
     function snapshotPage(trigger) {
-      if (!pageViewId) {
-        return;
+      if (!pageViewId || finalizedPageViewId === pageViewId) {
+        return [];
       }
+      var ids = [];
       var pageId = pageViewId;
-      emitSnapshot('page_engagement', pageId, engagementPayload(), false, trigger);
-      emitSnapshot('page_performance', pageId, performancePayload(), false, trigger);
-      emitSnapshot('resource_summary', pageId, resourceSummaryPayload(), false, trigger);
+      var event;
+      event = emitSnapshot('page_engagement', pageId, engagementPayload(), false, trigger);
+      if (event) {
+        ids.push(event.clientEventId);
+      }
+      event = emitSnapshot('page_performance', pageId, performancePayload(), false, trigger);
+      if (event) {
+        ids.push(event.clientEventId);
+      }
+      event = emitSnapshot('resource_summary', pageId, resourceSummaryPayload(), false, trigger);
+      if (event) {
+        ids.push(event.clientEventId);
+      }
+      return ids;
+    }
+
+    function snapshotBackgroundOnce(trigger) {
+      if (!pageViewId || finalizedPageViewId === pageViewId) {
+        return [];
+      }
+      if (backgroundSnapshotPageViewId === pageViewId) {
+        return [];
+      }
+      backgroundSnapshotPageViewId = pageViewId;
+      return snapshotPage(trigger);
     }
 
     function finalizePage(trigger) {
@@ -2159,24 +2188,26 @@
     function onVisibility() {
       tickEngagement();
       if (document.visibilityState === 'hidden') {
-        snapshotPage('hidden');
-        flush(true);
-      } else {
-        visibleOn = perfNow();
-        if (isActive()) {
-          activeOn = visibleOn;
-        }
+        var priorityIds = snapshotBackgroundOnce('hidden');
+        flush(true, priorityIds);
+        return;
+      }
+      backgroundSnapshotPageViewId = '';
+      visibleOn = perfNow();
+      if (isActive()) {
+        activeOn = visibleOn;
       }
     }
 
     function onPageHide(event) {
       tickEngagement();
       if (event && event.persisted === true) {
-        snapshotPage('pagehide_bfcache');
+        var priorityIds = snapshotBackgroundOnce('pagehide_bfcache');
+        flush(true, priorityIds);
       } else {
         finalizePage('pagehide');
+        flush(true);
       }
-      flush(true);
     }
 
     function wrapHistory(method) {
@@ -2315,6 +2346,7 @@
         capture();
         syncForms();
         if (event && event.persisted === true) {
+          backgroundSnapshotPageViewId = '';
           visibleOn = perfNow();
           if (isActive()) {
             activeOn = visibleOn;
@@ -2411,6 +2443,7 @@
       l: 1,
       _diagnostics: diagnostics,
       _codecIdToServerIdString: codecIdToServerIdString,
+      _emitSnapshot: emitSnapshot,
     };
 
     capture();

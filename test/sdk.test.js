@@ -1570,6 +1570,458 @@ async function run() {
     assert.strictEqual(retried._batch.visitorId, visitorA);
   });
 
+  function beaconEvents(env) {
+    const all = [];
+    env.beacons.forEach((item) => {
+      JSON.parse(item.body).events.forEach((event) => all.push(event));
+    });
+    return all;
+  }
+
+  function uniqueEvents(events) {
+    const seen = {};
+    return events.filter((event) => {
+      if (seen[event.clientEventId]) return false;
+      seen[event.clientEventId] = 1;
+      return true;
+    });
+  }
+
+  function lifecycleOf(events, pageViewId) {
+    return uniqueEvents(events).filter((event) => {
+      return event.pageViewId === pageViewId &&
+        (event.type === 'page_engagement' || event.type === 'page_performance' || event.type === 'resource_summary');
+    });
+  }
+
+  await test('hidden then real pagehide is snapshot plus final', async () => {
+    const env = await load();
+    await env.drain();
+    const pageId = ofType(env, 'page_view')[0].pageViewId;
+    env.beacons.length = 0;
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    env.dispatch('pagehide', env.document, { persisted: false });
+    const life = lifecycleOf(beaconEvents(env), pageId);
+    assert.strictEqual(life.length, 6);
+    ['page_engagement', 'page_performance', 'resource_summary'].forEach((type) => {
+      const snap = life.find((event) => event.type === type && event.eventFinal === 0);
+      const fin = life.find((event) => event.type === type && event.eventFinal === 1);
+      assert.ok(snap);
+      assert.ok(fin);
+      assert.ok(fin.eventRevision > snap.eventRevision);
+      assert.ok(fin.sequence > snap.sequence);
+    });
+  });
+
+  await test('hidden after final creates nothing', async () => {
+    const env = await load();
+    await env.drain();
+    const pageId = ofType(env, 'page_view')[0].pageViewId;
+    env.beacons.length = 0;
+    env.dispatch('pagehide', env.document, { persisted: false });
+    const before = lifecycleOf(beaconEvents(env), pageId);
+    const beforeSeq = Math.max.apply(null, before.map((event) => event.sequence));
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    const after = lifecycleOf(beaconEvents(env), pageId);
+    assert.strictEqual(after.length, 3);
+    assert.ok(after.every((event) => event.eventFinal === 1));
+    assert.strictEqual(Math.max.apply(null, after.map((event) => event.sequence)), beforeSeq);
+  });
+
+  await test('hidden then bfcache pagehide is one snapshot', async () => {
+    const env = await load();
+    await env.drain();
+    const pageId = ofType(env, 'page_view')[0].pageViewId;
+    env.beacons.length = 0;
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    env.dispatch('pagehide', env.document, { persisted: true });
+    const life = lifecycleOf(beaconEvents(env), pageId);
+    assert.strictEqual(life.length, 3);
+    assert.ok(life.every((event) => event.eventFinal === 0 && event.engagementTrigger === 'hidden'));
+  });
+
+  await test('bfcache pagehide then hidden is one snapshot', async () => {
+    const env = await load();
+    await env.drain();
+    const pageId = ofType(env, 'page_view')[0].pageViewId;
+    env.beacons.length = 0;
+    env.dispatch('pagehide', env.document, { persisted: true });
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    const life = lifecycleOf(beaconEvents(env), pageId);
+    assert.strictEqual(life.length, 3);
+    assert.ok(life.every((event) => event.eventFinal === 0 && event.engagementTrigger === 'pagehide_bfcache'));
+  });
+
+  await test('repeated hidden without visible is one snapshot', async () => {
+    const env = await load();
+    await env.drain();
+    const pageId = ofType(env, 'page_view')[0].pageViewId;
+    env.beacons.length = 0;
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    const first = lifecycleOf(beaconEvents(env), pageId);
+    env.dispatch('visibilitychange');
+    env.dispatch('visibilitychange');
+    const again = lifecycleOf(beaconEvents(env), pageId);
+    assert.strictEqual(first.length, 3);
+    assert.strictEqual(again.length, 3);
+    assert.deepStrictEqual(again.map((event) => event.clientEventId), first.map((event) => event.clientEventId));
+  });
+
+  await test('two hidden cycles after visible', async () => {
+    const env = await load();
+    await env.drain();
+    const pageId = ofType(env, 'page_view')[0].pageViewId;
+    env.beacons.length = 0;
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    env.document.visibilityState = 'visible';
+    env.dispatch('visibilitychange');
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    const life = lifecycleOf(beaconEvents(env), pageId);
+    assert.strictEqual(life.length, 6);
+    assert.ok(life.every((event) => event.eventFinal === 0));
+  });
+
+  await test('bfcache restore allows a new hidden snapshot', async () => {
+    const env = await load();
+    await env.drain();
+    const page = ofType(env, 'page_view')[0];
+    env.beacons.length = 0;
+    env.dispatch('pagehide', env.document, { persisted: true });
+    env.dispatch('pageshow', env.document, { persisted: true });
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    const batches = env.beacons.map((item) => JSON.parse(item.body));
+    const life = lifecycleOf(beaconEvents(env), page.pageViewId);
+    assert.strictEqual(life.length, 6);
+    assert.ok(life.every((event) => event.eventFinal === 0 && event.pageViewId === page.pageViewId));
+    assert.ok(batches.every((batch) => batch.visitorId === batches[0].visitorId && batch.sessionId === batches[0].sessionId));
+    assert.ok(!life.some((event) => event.eventFinal === 1));
+  });
+
+  await test('bfcache restore then real pagehide is one final', async () => {
+    const env = await load();
+    await env.drain();
+    const pageId = ofType(env, 'page_view')[0].pageViewId;
+    env.beacons.length = 0;
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    env.dispatch('pagehide', env.document, { persisted: true });
+    env.dispatch('pageshow', env.document, { persisted: true });
+    env.document.visibilityState = 'visible';
+    env.dispatch('visibilitychange');
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    env.dispatch('pagehide', env.document, { persisted: false });
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    const life = lifecycleOf(beaconEvents(env), pageId);
+    const finals = life.filter((event) => event.eventFinal === 1);
+    const snaps = life.filter((event) => event.eventFinal === 0);
+    assert.strictEqual(finals.length, 3);
+    assert.strictEqual(snaps.length, 6);
+    const lastFinalSeq = Math.max.apply(null, finals.map((event) => event.sequence));
+    assert.ok(snaps.every((event) => event.sequence < lastFinalSeq));
+  });
+
+  await test('spa after hidden keeps one final and a fresh page', async () => {
+    const env = await load();
+    await env.drain();
+    const pageA = ofType(env, 'page_view')[0].pageViewId;
+    env.beacons.length = 0;
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    env.document.visibilityState = 'visible';
+    env.dispatch('visibilitychange');
+    env.setPath('/next');
+    env.history.pushState({}, '', '/next');
+    await env.drain();
+    const pageB = ofType(env, 'page_view').map((event) => event.pageViewId).find((id) => id !== pageA);
+    const all = beaconEvents(env).concat(eventsFrom(env));
+    const lifeA = lifecycleOf(all, pageA);
+    assert.strictEqual(lifeA.filter((event) => event.eventFinal === 1).length, 3);
+    assert.ok(lifeA.some((event) => event.eventFinal === 0 && event.engagementTrigger === 'hidden'));
+    const finalSeq = Math.min.apply(null, lifeA.filter((event) => event.eventFinal === 1).map((event) => event.sequence));
+    assert.ok(!lifeA.some((event) => event.eventFinal === 0 && event.sequence > finalSeq));
+    env.beacons.length = 0;
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    const lifeB = lifecycleOf(beaconEvents(env), pageB);
+    assert.strictEqual(lifeB.length, 3);
+    assert.ok(lifeB.every((event) => event.eventFinal === 0 && event.pageViewId === pageB));
+  });
+
+  await test('suppressed lifecycle callback does not gap sequence', async () => {
+    const env = await load();
+    await env.drain();
+    env.beacons.length = 0;
+    env.dispatch('pagehide', env.document, { persisted: false });
+    const finals = lifecycleOf(beaconEvents(env), ofType(env, 'page_view')[0].pageViewId);
+    const lastSeq = Math.max.apply(null, finals.map((event) => event.sequence));
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    env.dispatch('visibilitychange');
+    env.window.RefIQ.event('after_final', {});
+    await env.drain();
+    const created = eventsFrom(env).find((event) => event.type === 'after_final');
+    assert.ok(created);
+    assert.strictEqual(created.sequence, lastSeq + 1);
+  });
+
+  await test('periodic snapshot after final is suppressed', async () => {
+    const env = await load();
+    await env.drain();
+    const pageId = ofType(env, 'page_view')[0].pageViewId;
+    env.dispatch('pagehide', env.document, { persisted: false });
+    const idbSize = env.idb.data.size;
+    const fetchCount = env.fetches.length;
+    env.window.RefIQ._emitSnapshot('page_performance', pageId, { marker: 'late' }, false, 'periodic');
+    env.window.RefIQ._emitSnapshot('page_engagement', pageId, { marker: 'late' }, false, 'periodic');
+    env.window.RefIQ._emitSnapshot('resource_summary', pageId, { marker: 'late' }, false, 'periodic');
+    assert.strictEqual(env.fetches.length, fetchCount);
+    assert.strictEqual(env.idb.data.size, idbSize);
+    assert.ok(!beaconEvents(env).some((event) => event.payload && event.payload.marker === 'late'));
+  });
+
+  await test('no snapshot exists after final in sequence order', async () => {
+    const env = await load();
+    await env.drain();
+    const pageId = ofType(env, 'page_view')[0].pageViewId;
+    env.beacons.length = 0;
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    env.dispatch('pagehide', env.document, { persisted: false });
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    const life = lifecycleOf(beaconEvents(env), pageId).sort((a, b) => a.sequence - b.sequence);
+    let seenFinal = false;
+    life.forEach((event) => {
+      if (seenFinal) {
+        assert.notStrictEqual(event.eventFinal, 0);
+      }
+      if (event.eventFinal === 1) seenFinal = true;
+    });
+  });
+
+  function lastBeacon(env) {
+    return JSON.parse(env.beacons[env.beacons.length - 1].body);
+  }
+
+  function seedBacklog(env, count) {
+    for (let i = 0; i < count; i += 1) {
+      env.window.RefIQ.event('backlog', { i });
+    }
+  }
+
+  function trioIndexes(events, trigger) {
+    return ['page_engagement', 'page_performance', 'resource_summary'].map((type) => {
+      return events.findIndex((event) => event.type === type && event.engagementTrigger === trigger && event.eventFinal === 0);
+    });
+  }
+
+  await test('hidden snapshot is beacon priority ahead of backlog', async () => {
+    const env = await load();
+    await env.drain();
+    seedBacklog(env, 8);
+    env.beacons.length = 0;
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    const events = lastBeacon(env).events;
+    const indexes = trioIndexes(events, 'hidden');
+    assert.ok(indexes.every((index) => index >= 0));
+    const firstBacklog = events.findIndex((event) => event.type === 'backlog');
+    assert.ok(firstBacklog > Math.max.apply(null, indexes));
+    assert.ok(events.filter((event) => indexes.indexOf(events.indexOf(event)) !== -1).every((event) => event.eventFinal === 0));
+  });
+
+  await test('bfcache snapshot is beacon priority ahead of backlog', async () => {
+    const env = await load();
+    await env.drain();
+    seedBacklog(env, 8);
+    env.beacons.length = 0;
+    env.dispatch('pagehide', env.document, { persisted: true });
+    const events = lastBeacon(env).events;
+    const indexes = trioIndexes(events, 'pagehide_bfcache');
+    assert.strictEqual(indexes.filter((index) => index >= 0).length, 3);
+    const firstBacklog = events.findIndex((event) => event.type === 'backlog');
+    assert.ok(firstBacklog > Math.max.apply(null, indexes));
+    assert.ok(indexes.every((index) => events[index].eventFinal === 0));
+  });
+
+  await test('real pagehide still prioritizes final trio', async () => {
+    const env = await load();
+    await env.drain();
+    seedBacklog(env, 8);
+    env.beacons.length = 0;
+    env.dispatch('pagehide', env.document, { persisted: false });
+    const events = lastBeacon(env).events;
+    const finals = ['page_engagement', 'page_performance', 'resource_summary'].map((type) => {
+      return events.findIndex((event) => event.type === type && event.eventFinal === 1 && event.engagementTrigger === 'pagehide');
+    });
+    assert.ok(finals.every((index) => index >= 0));
+    const firstBacklog = events.findIndex((event) => event.type === 'backlog');
+    assert.ok(firstBacklog > Math.max.apply(null, finals));
+  });
+
+  await test('hidden priority does not replace later final priority', async () => {
+    const env = await load();
+    await env.drain();
+    seedBacklog(env, 4);
+    env.beacons.length = 0;
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    env.dispatch('pagehide', env.document, { persisted: false });
+    const events = lastBeacon(env).events;
+    const firstFinal = events.findIndex((event) => event.eventFinal === 1);
+    const firstSnap = events.findIndex((event) => event.eventFinal === 0 && event.engagementTrigger === 'hidden');
+    assert.ok(firstFinal >= 0);
+    assert.ok(firstFinal < firstSnap);
+    assert.strictEqual(events.filter((event) => event.eventFinal === 1 && event.engagementTrigger === 'pagehide').length, 3);
+  });
+
+  await test('priority ids are not reused by the next lifecycle flush', async () => {
+    const env = await load();
+    await env.drain();
+    seedBacklog(env, 4);
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    const snapIds = trioIndexes(lastBeacon(env).events, 'hidden').map((index) => lastBeacon(env).events[index].clientEventId);
+    env.beacons.length = 0;
+    env.dispatch('pagehide', env.document, { persisted: false });
+    const events = lastBeacon(env).events;
+    const firstThree = events.slice(0, 3).map((event) => event.clientEventId);
+    snapIds.forEach((id) => assert.ok(firstThree.indexOf(id) === -1));
+    assert.ok(events.slice(0, 3).every((event) => event.eventFinal === 1));
+  });
+
+  await test('lifecycle beacon priority keeps session isolation', async () => {
+    const envA = await load();
+    await envA.drain();
+    const sessionA = JSON.parse(envA.fetches[0].body).sessionId;
+    envA.setFetch(async () => {
+      throw new Error('hold');
+    });
+    envA.window.RefIQ.event('A1');
+    envA.window.RefIQ.event('A2');
+    await envA.drain();
+    const rows = Array.from(envA.idb.data.values()).filter((row) => row.event && (row.event.type === 'A1' || row.event.type === 'A2'));
+    const envB = await load({ idbRows: rows, href: 'https://shop.example.com/other' });
+    envB.beacons.length = 0;
+    envB.window.RefIQ.event('B1');
+    envB.document.visibilityState = 'hidden';
+    envB.dispatch('visibilitychange');
+    const beacon = lastBeacon(envB);
+    assert.notStrictEqual(beacon.sessionId, sessionA);
+    assert.ok(beacon.events.some((event) => event.type === 'page_engagement' && event.eventFinal === 0));
+    assert.ok(beacon.events.some((event) => event.type === 'page_performance' && event.eventFinal === 0));
+    assert.ok(beacon.events.some((event) => event.type === 'resource_summary' && event.eventFinal === 0));
+    assert.ok(!beacon.events.some((event) => event.type === 'A1' || event.type === 'A2'));
+    const engagementAt = beacon.events.findIndex((event) => event.type === 'page_engagement' && event.engagementTrigger === 'hidden');
+    const backlogAt = beacon.events.findIndex((event) => event.type === 'B1');
+    assert.ok(engagementAt >= 0 && engagementAt < backlogAt);
+  });
+
+  await test('priority beacon true keeps events for later fetch', async () => {
+    const env = await load();
+    await env.drain();
+    env.beacons.length = 0;
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    const beacon = lastBeacon(env);
+    const engagement = beacon.events.find((event) => event.type === 'page_engagement' && event.engagementTrigger === 'hidden');
+    const stored = Array.from(env.idb.data.values()).find((row) => row.event && row.event.clientEventId === engagement.clientEventId);
+    assert.ok(stored);
+    assert.strictEqual(stored.event.sequence, engagement.sequence);
+    assert.strictEqual(stored.event.pageViewId, engagement.pageViewId);
+    assert.strictEqual(stored.event.eventRevision, engagement.eventRevision);
+    assert.strictEqual(stored.event.eventFinal, 0);
+    assert.strictEqual(stored.event.visitorId, beacon.visitorId);
+    assert.strictEqual(stored.event.sessionId, beacon.sessionId);
+    env.document.visibilityState = 'visible';
+    await env.drain();
+    const retried = eventsFrom(env).find((event) => event.clientEventId === engagement.clientEventId);
+    assert.ok(retried);
+    assert.strictEqual(retried.sequence, engagement.sequence);
+    assert.strictEqual(retried.eventFinal, 0);
+    assert.strictEqual(retried._batch.sessionId, beacon.sessionId);
+  });
+
+  await test('priority beacon false uses the same keepalive body', async () => {
+    const env = await load({ beaconResult: false });
+    await env.drain();
+    const before = env.window.RefIQ._diagnostics.keepaliveAttempts;
+    env.fetches.length = 0;
+    env.beacons.length = 0;
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    assert.ok(env.window.RefIQ._diagnostics.keepaliveAttempts > before);
+    const keepalive = env.fetches.find((item) => item.keepalive);
+    assert.ok(keepalive);
+    assert.strictEqual(keepalive.body, env.beacons[env.beacons.length - 1].body);
+    const events = JSON.parse(keepalive.body).events;
+    assert.strictEqual(trioIndexes(events, 'hidden').filter((index) => index >= 0).length, 3);
+  });
+
+  await test('background cycles keep each snapshot trio ahead of backlog', async () => {
+    const env = await load();
+    await env.drain();
+    seedBacklog(env, 5);
+    env.beacons.length = 0;
+    const known = new Set();
+    function assertFreshTrio(trigger) {
+      const events = lastBeacon(env).events;
+      const fresh = events.filter((event) => {
+        return !known.has(event.clientEventId) &&
+          event.eventFinal === 0 &&
+          event.engagementTrigger === trigger &&
+          (event.type === 'page_engagement' || event.type === 'page_performance' || event.type === 'resource_summary');
+      });
+      assert.strictEqual(fresh.length, 3);
+      const firstKnown = events.findIndex((event) => known.has(event.clientEventId));
+      fresh.forEach((event) => {
+        const at = events.findIndex((item) => item.clientEventId === event.clientEventId);
+        if (firstKnown !== -1) assert.ok(at < firstKnown);
+        known.add(event.clientEventId);
+      });
+    }
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    assertFreshTrio('hidden');
+    env.document.visibilityState = 'visible';
+    env.dispatch('visibilitychange');
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    assertFreshTrio('hidden');
+    env.dispatch('pageshow', env.document, { persisted: true });
+    env.document.visibilityState = 'visible';
+    env.dispatch('visibilitychange');
+    env.dispatch('pagehide', env.document, { persisted: true });
+    assertFreshTrio('pagehide_bfcache');
+    env.dispatch('pageshow', env.document, { persisted: true });
+    env.document.visibilityState = 'visible';
+    env.dispatch('visibilitychange');
+    env.setPath('/next');
+    env.history.pushState({}, '', '/next');
+    await env.drain();
+    const all = [];
+    const seen = {};
+    eventsFrom(env).concat(beaconEvents(env)).forEach((event) => {
+      if (seen[event.clientEventId]) return;
+      seen[event.clientEventId] = 1;
+      all.push(event);
+    });
+    all.sort((a, b) => a.sequence - b.sequence);
+    for (let i = 1; i < all.length; i += 1) {
+      assert.strictEqual(all[i].sequence, all[i - 1].sequence + 1);
+    }
+  });
+
   console.log('\n' + passed + ' tests passed');
 }
 
