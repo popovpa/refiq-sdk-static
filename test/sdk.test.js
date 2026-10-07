@@ -2022,6 +2022,145 @@ async function run() {
     }
   });
 
+  function assertAtomicTrio(env, trigger) {
+    assert.strictEqual(env.fetches.length, 0);
+    const beacon = lastBeacon(env);
+    const trio = ['page_engagement', 'page_performance', 'resource_summary'].map((type) => {
+      return beacon.events.find((event) => event.type === type && event.engagementTrigger === trigger && event.eventFinal === 0);
+    });
+    assert.ok(trio.every(Boolean));
+    assert.strictEqual(trio[1].sequence, trio[0].sequence + 1);
+    assert.strictEqual(trio[2].sequence, trio[1].sequence + 1);
+    assert.strictEqual(new Set(trio.map((event) => event.pageViewId)).size, 1);
+    trio.forEach((event) => {
+      const row = env.idb.data.get(event.clientEventId);
+      assert.ok(row && row.event);
+      assert.strictEqual(row.event.clientEventId, event.clientEventId);
+      assert.strictEqual(row.event.sequence, event.sequence);
+      assert.strictEqual(row.event.eventRevision, event.eventRevision);
+      assert.strictEqual(row.event.eventFinal, 0);
+      assert.strictEqual(row.event.visitorId, beacon.visitorId);
+      assert.strictEqual(row.event.sessionId, beacon.sessionId);
+    });
+  }
+
+  async function countUntilFetch(payload) {
+    const env = await load();
+    await env.drain();
+    env.fetches.length = 0;
+    let count = 0;
+    while (count < 30 && env.fetches.length === 0) {
+      env.window.RefIQ.event('pad', payload);
+      count += 1;
+    }
+    return count;
+  }
+
+  function tinyRows(count) {
+    const rows = [];
+    for (let i = 1; i <= count; i += 1) {
+      const id = '1600000000001.' + (10 + i);
+      rows.push({
+        clientEventId: id,
+        occurredAtMs: Date.now(),
+        event: {
+          clientEventId: id,
+          visitorId: '1600000000001.1',
+          sessionId: '1600000000001.2',
+          type: 'tiny',
+          sequence: i,
+          pageViewId: '1600000000001.3',
+          occurredAtMs: Date.now(),
+          payload: { n: i },
+          eventRevision: 1,
+          eventFinal: 1,
+        },
+      });
+    }
+    return rows;
+  }
+
+  async function loadAtCountThreshold() {
+    const env = await load({
+      idbRows: tinyRows(19),
+      href: 'https://shop.example.com/count-threshold',
+    });
+    env.fetches.length = 0;
+    env.beacons.length = 0;
+    return env;
+  }
+
+  await test('snapshot trio is not split at event-count threshold', async () => {
+    const env = await loadAtCountThreshold();
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    assertAtomicTrio(env, 'hidden');
+    assert.ok(!lastBeacon(env).events.some((event) => event.type === 'tiny'));
+  });
+
+  await test('bfcache trio is not split at event-count threshold', async () => {
+    const env = await loadAtCountThreshold();
+    env.dispatch('pagehide', env.document, { persisted: true });
+    assertAtomicTrio(env, 'pagehide_bfcache');
+    assert.ok(!lastBeacon(env).events.some((event) => event.type === 'tiny'));
+  });
+
+  await test('snapshot trio is not split at byte threshold', async () => {
+    const payload = { i: 1 };
+    const crossedAt = await countUntilFetch(payload);
+    assert.ok(crossedAt > 1 && crossedAt < 20);
+    const env = await load();
+    await env.drain();
+    env.fetches.length = 0;
+    env.beacons.length = 0;
+    for (let i = 0; i < crossedAt - 1; i += 1) env.window.RefIQ.event('pad', payload);
+    assert.strictEqual(env.fetches.length, 0);
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    assertAtomicTrio(env, 'hidden');
+  });
+
+  await test('bfcache trio is not split at byte threshold', async () => {
+    const payload = { i: 1 };
+    const crossedAt = await countUntilFetch(payload);
+    assert.ok(crossedAt > 1 && crossedAt < 20);
+    const env = await load();
+    await env.drain();
+    env.fetches.length = 0;
+    env.beacons.length = 0;
+    for (let i = 0; i < crossedAt - 1; i += 1) env.window.RefIQ.event('pad', payload);
+    assert.strictEqual(env.fetches.length, 0);
+    env.dispatch('pagehide', env.document, { persisted: true });
+    assertAtomicTrio(env, 'pagehide_bfcache');
+  });
+
+  await test('ordinary enqueue still auto-flushes at both thresholds', async () => {
+    const byCount = await loadAtCountThreshold();
+    byCount.window.RefIQ.event('ordinary-count');
+    assert.ok(byCount.fetches.length >= 1);
+    const byBytes = await countUntilFetch({ blob: 'x'.repeat(200) });
+    assert.ok(byBytes > 1 && byBytes < 20);
+  });
+
+  await test('periodic snapshot still uses ordinary auto-flush', async () => {
+    const payload = { i: 1 };
+    const crossedAt = await countUntilFetch(payload);
+    const env = await load();
+    await env.drain();
+    const pageId = ofType(env, 'page_view')[0].pageViewId;
+    env.fetches.length = 0;
+    for (let i = 0; i < crossedAt - 1; i += 1) env.window.RefIQ.event('pad', payload);
+    assert.strictEqual(env.fetches.length, 0);
+    env.window.RefIQ._emitSnapshot('page_performance', pageId, { marker: 'periodic-probe' }, false, 'periodic');
+    assert.ok(env.fetches.length >= 1);
+    const sent = eventsFrom(env).find((event) => event.payload && event.payload.marker === 'periodic-probe');
+    const stored = Array.from(env.idb.data.values()).find((row) => row.event && row.event.payload && row.event.payload.marker === 'periodic-probe');
+    const event = sent || (stored && stored.event);
+    assert.ok(event);
+    assert.strictEqual(event.engagementTrigger, 'periodic');
+    assert.strictEqual(event.eventFinal, 0);
+  });
+
   console.log('\n' + passed + ' tests passed');
 }
 

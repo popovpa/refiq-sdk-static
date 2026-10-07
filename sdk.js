@@ -948,7 +948,7 @@
       return snapshotRevisions[key];
     }
 
-    function emitSnapshot(type, pageId, payload, isFinal, trigger) {
+    function emitSnapshot(type, pageId, payload, isFinal, trigger, options) {
       if (!pageId) {
         return null;
       }
@@ -964,7 +964,7 @@
           event.payload.engagementTrigger = trigger;
         }
       }
-      enqueue(event);
+      enqueue(event, options);
       if (isFinal) {
         lastFinalEventIds.push(event.clientEventId);
       }
@@ -1135,13 +1135,17 @@
       });
     }
 
-    function enqueue(event) {
+    function enqueue(event, options) {
       if (!event || !analyticsAllowed()) {
         return;
       }
+      options = options || {};
       memoryQueue.push(event);
       idbPut(event);
       trimQueue();
+      if (options.deferAutoFlush === true) {
+        return;
+      }
       if (memoryQueue.length >= MAX_EVENTS_PER_BATCH || queueBytes() >= MAX_BATCH_BYTES) {
         flush(false);
       } else {
@@ -1693,20 +1697,29 @@
       }
       var ids = [];
       var pageId = pageViewId;
-      var event;
-      event = emitSnapshot('page_engagement', pageId, engagementPayload(), false, trigger);
-      if (event) {
-        ids.push(event.clientEventId);
+      var completed = false;
+      var defer = { deferAutoFlush: true };
+      try {
+        var event;
+        event = emitSnapshot('page_engagement', pageId, engagementPayload(), false, trigger, defer);
+        if (event) {
+          ids.push(event.clientEventId);
+        }
+        event = emitSnapshot('page_performance', pageId, performancePayload(), false, trigger, defer);
+        if (event) {
+          ids.push(event.clientEventId);
+        }
+        event = emitSnapshot('resource_summary', pageId, resourceSummaryPayload(), false, trigger, defer);
+        if (event) {
+          ids.push(event.clientEventId);
+        }
+        completed = true;
+        return ids;
+      } finally {
+        if (!completed && ids.length) {
+          scheduleFlush();
+        }
       }
-      event = emitSnapshot('page_performance', pageId, performancePayload(), false, trigger);
-      if (event) {
-        ids.push(event.clientEventId);
-      }
-      event = emitSnapshot('resource_summary', pageId, resourceSummaryPayload(), false, trigger);
-      if (event) {
-        ids.push(event.clientEventId);
-      }
-      return ids;
     }
 
     function snapshotBackgroundOnce(trigger) {
