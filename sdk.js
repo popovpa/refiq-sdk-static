@@ -44,7 +44,7 @@
     var MAX_BEACON_BYTES = 60000;
     var MAX_QUEUE_SIZE = 500;
     var MAX_RETENTION_MS = 604800000;
-    var SESSION_TIMEOUT_MS = 1800000;
+    var SESSION_TIMEOUT_MS = 60000;
     var MAX_RETRY = 8;
     var BASE_BACKOFF_MS = 1000;
     var MAX_BACKOFF_MS = 16000;
@@ -74,6 +74,7 @@
     var PVI_KEY = '_refiq_pvi';
     var LAST_PVID_KEY = '_refiq_last_pvid';
     var ATTR_KEY = '_refiq_attr';
+    var RQCID_META_KEY = '_refiq_rqcid_meta';
     var CONSENT_KEY = '_refiq_consent';
     var IDB_NAME = 'refiq_cs';
     var IDB_STORE = 'q';
@@ -100,6 +101,7 @@
     var pageSnapshots = {};
     var snapshotRevisions = {};
     var rqcidCapturedAtMs = 0;
+    var formSubmitters = new WeakMap();
     var memoryQueue = [];
     var inflight = false;
     var flushTimer = 0;
@@ -359,6 +361,12 @@
       } catch (e) {}
     }
 
+    function removeStorage(storage, name) {
+      try {
+        storage.removeItem(name);
+      } catch (e) {}
+    }
+
     function isRqcid(value) {
       return typeof value === 'string' && RQCID_RE.test(value);
     }
@@ -368,14 +376,59 @@
       return match ? match[1] : '';
     }
 
+    function readRqcidMeta(storage, rqcid) {
+      var meta = loadJson(storage, RQCID_META_KEY);
+      var captured;
+      if (!meta || typeof meta !== 'object') {
+        return 0;
+      }
+      if (!isRqcid(meta.rqcid) || meta.rqcid !== rqcid) {
+        return 0;
+      }
+      captured = toInteger(meta.capturedAtMs);
+      if (!captured || captured <= 0) {
+        return 0;
+      }
+      return captured;
+    }
+
+    function findRqcidCapturedAt(rqcid) {
+      var local = readRqcidMeta(window.localStorage, rqcid);
+      if (local) {
+        return local;
+      }
+      return readRqcidMeta(window.sessionStorage, rqcid);
+    }
+
+    function saveRqcidMeta(rqcid, capturedAtMs) {
+      var meta = {
+        rqcid: rqcid,
+        capturedAtMs: capturedAtMs,
+      };
+      saveJson(window.localStorage, RQCID_META_KEY, meta);
+      saveJson(window.sessionStorage, RQCID_META_KEY, meta);
+    }
+
     function persist(rqcid) {
+      var capturedAt = 0;
       if (!isRqcid(rqcid)) {
         return;
       }
-      if (stored !== rqcid) {
-        rqcidCapturedAtMs = now();
+      if (stored === rqcid && rqcidCapturedAtMs > 0) {
+        capturedAt = rqcidCapturedAtMs;
+      } else if (!stored) {
+        capturedAt = findRqcidCapturedAt(rqcid);
+        if (!capturedAt) {
+          capturedAt = now();
+        }
+      } else if (stored !== rqcid) {
+        capturedAt = now();
+      }
+      if (!capturedAt) {
+        capturedAt = now();
       }
       stored = rqcid;
+      rqcidCapturedAtMs = capturedAt;
       writeStorage(window.localStorage, rqcid);
       writeStorage(window.sessionStorage, rqcid);
       var cookie = KEY + '=' + rqcid + ';path=/;max-age=' + COOKIE_MAX_AGE + ';SameSite=Lax';
@@ -383,6 +436,7 @@
         cookie += ';Secure';
       }
       document.cookie = cookie;
+      saveRqcidMeta(rqcid, capturedAt);
     }
 
     function capture() {
@@ -412,61 +466,101 @@
       return stored;
     }
 
-    function findNamedInput(form, name) {
-      var inputs = form.getElementsByTagName('input');
-      var i;
-      for (i = 0; i < inputs.length; i++) {
-        if (inputs[i].name === name) {
-          return inputs[i];
+    function documentBaseUrl() {
+      try {
+        if (document.baseURI) {
+          return new URL(document.baseURI, window.location.href);
         }
-      }
+      } catch (e) {}
+      try {
+        return new URL(window.location.href);
+      } catch (e2) {}
       return null;
     }
 
-    function ensureFormField(form) {
-      if (!stored || !form || !form.appendChild) {
-        return;
+    function attributeValue(el, name) {
+      if (!el || typeof el.hasAttribute !== 'function' || typeof el.getAttribute !== 'function') {
+        return null;
       }
-      var input = findNamedInput(form, KEY);
-      if (!input) {
-        input = document.createElement('input');
-        input.type = 'hidden';
-        input.name = KEY;
-        form.appendChild(input);
+      if (!el.hasAttribute(name)) {
+        return null;
       }
-      input.value = stored;
+      var value = el.getAttribute(name);
+      return value == null ? '' : String(value);
     }
 
-    function syncForms() {
-      if (!stored) {
-        return;
+    function isSafeFormDestination(form, submitter) {
+      var base = documentBaseUrl();
+      var raw;
+      var target;
+      var page;
+      if (!base) {
+        return false;
       }
-      var forms = document.getElementsByTagName('form');
-      var i;
-      for (i = 0; i < forms.length; i++) {
-        ensureFormField(forms[i]);
+      raw = attributeValue(submitter, 'formaction');
+      if (raw == null) {
+        raw = attributeValue(form, 'action');
       }
-    }
-
-    function decorateUrl(href) {
-      if (!stored || !href) {
-        return href;
+      if (raw == null) {
+        raw = '';
       }
       try {
-        var url = new URL(href, window.location.href);
-        if (url.origin !== window.location.origin) {
-          return href;
-        }
-        if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-          return href;
-        }
-        if (!isRqcid(url.searchParams.get(KEY))) {
-          url.searchParams.set(KEY, stored);
-        }
-        return url.toString();
+        target = raw === '' ? new URL(window.location.href) : new URL(raw, base);
       } catch (e) {
-        return href;
+        return false;
       }
+      if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+        return false;
+      }
+      try {
+        page = new URL(window.location.href);
+      } catch (e2) {
+        return false;
+      }
+      return target.origin === page.origin;
+    }
+
+    function rememberSubmitter(form, submitter) {
+      var token = submitter || null;
+      try {
+        formSubmitters.set(form, token);
+      } catch (e) {
+        return;
+      }
+      if (typeof queueMicrotask !== 'function') {
+        return;
+      }
+      queueMicrotask(function () {
+        try {
+          if (formSubmitters.get(form) === token) {
+            formSubmitters.delete(form);
+          }
+        } catch (e2) {}
+      });
+    }
+
+    function takeSubmitter(form) {
+      var value;
+      try {
+        if (!formSubmitters.has(form)) {
+          return null;
+        }
+        value = formSubmitters.get(form);
+        formSubmitters.delete(form);
+        return value;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    function appendRqcid(data) {
+      if (!data || typeof data.append !== 'function' || !isRqcid(stored)) {
+        return;
+      }
+      if (typeof data.has === 'function' && data.has(KEY)) {
+        return;
+      }
+      data.append(KEY, stored);
     }
 
     function hashRoute() {
@@ -542,7 +636,36 @@
       return visitorId;
     }
 
-    function ensureSession() {
+    function startNewSession(t) {
+      sessionId = mintId();
+      sequence = 0;
+      sessionStartedTs = t;
+      previousPageViewId = '';
+      pageViewId = '';
+      lastPageViewUrl = '';
+      pageSnapshots = {};
+      snapshotRevisions = {};
+      finalizedPageViewId = '';
+      backgroundSnapshotPageViewId = '';
+      lastFinalEventIds = [];
+      landingPath = '';
+      landingOrigin = '';
+      landingHostname = '';
+      landingReferrer = '';
+      firstUtm = null;
+      writeStorage(window.sessionStorage, sessionId, SID_KEY);
+      writeStorage(window.sessionStorage, '0', SEQ_KEY);
+      writeStorage(window.sessionStorage, String(t), SST_KEY);
+      writeStorage(window.sessionStorage, String(t), SACT_KEY);
+      writeStorage(window.sessionStorage, '0', PVI_KEY);
+      writeStorage(window.sessionStorage, '', LAST_PVID_KEY);
+      removeStorage(window.sessionStorage, ATTR_KEY);
+    }
+
+    function ensureSession(options) {
+      options = options || {};
+      var allowTimeoutRollover = options.allowTimeoutRollover !== false;
+      var touchActivity = options.touchActivity !== false;
       var t = now();
       var storedSid = readStorage(window.sessionStorage, SID_KEY);
       var storedSeq = parseInt(readStorage(window.sessionStorage, SEQ_KEY), 10) || 0;
@@ -551,23 +674,43 @@
         sessionId = storedSid;
         sequence = storedSeq;
       }
-      if (!isCodecId(sessionId) || (lastAct && t - lastAct > SESSION_TIMEOUT_MS)) {
-        sessionId = mintId();
-        sequence = 0;
-        sessionStartedTs = t;
-        previousPageViewId = '';
-        writeStorage(window.sessionStorage, sessionId, SID_KEY);
-        writeStorage(window.sessionStorage, '0', SEQ_KEY);
-        writeStorage(window.sessionStorage, String(t), SST_KEY);
-        writeStorage(window.sessionStorage, '0', PVI_KEY);
-        writeStorage(window.sessionStorage, '', LAST_PVID_KEY);
-        pageSnapshots = {};
-        snapshotRevisions = {};
+      var timedOut = !!(lastAct && t - lastAct > SESSION_TIMEOUT_MS);
+      if (!isCodecId(sessionId) || (allowTimeoutRollover && timedOut)) {
+        startNewSession(t);
       } else if (!sessionStartedTs) {
         sessionStartedTs = parseInt(readStorage(window.sessionStorage, SST_KEY), 10) || t;
       }
-      writeStorage(window.sessionStorage, String(t), SACT_KEY);
+      if (touchActivity) {
+        writeStorage(window.sessionStorage, String(t), SACT_KEY);
+      }
       return sessionId;
+    }
+
+    function prepareActiveEventContext() {
+      var t = now();
+      ensureSession({ allowTimeoutRollover: false, touchActivity: false });
+      var lastAct = parseInt(readStorage(window.sessionStorage, SACT_KEY), 10) || 0;
+      var timedOut = !!(isCodecId(sessionId) && lastAct && t - lastAct > SESSION_TIMEOUT_MS);
+      if (!isCodecId(sessionId)) {
+        startNewSession(t);
+        sendPageView();
+        return;
+      }
+      if (timedOut) {
+        if (isCodecId(pageViewId)) {
+          var finalIds = finalizePage('session_timeout', { deferAutoFlush: true });
+          if (finalIds.length) {
+            scheduleFlush();
+          }
+        }
+        startNewSession(t);
+        sendPageView();
+        return;
+      }
+      writeStorage(window.sessionStorage, String(t), SACT_KEY);
+      if (!isCodecId(pageViewId)) {
+        sendPageView();
+      }
     }
 
     function ensureTab() {
@@ -887,7 +1030,7 @@
 
     function createEvent(type, payload, pageId) {
       ensureVisitor();
-      ensureSession();
+      ensureSession(snapshotType(type) ? { allowTimeoutRollover: false, touchActivity: false } : undefined);
       ensureTab();
       if (!isCodecId(pageViewId) && type !== 'page_view' && !pageId) {
         sendPageView();
@@ -1733,16 +1876,37 @@
       return snapshotPage(trigger);
     }
 
-    function finalizePage(trigger) {
+    function finalizePage(trigger, options) {
       if (!pageViewId || finalizedPageViewId === pageViewId) {
-        return;
+        return [];
       }
       var pageId = pageViewId;
+      var ids = [];
+      var completed = false;
+      var deferred = options && options.deferAutoFlush === true;
       finalizedPageViewId = pageId;
       lastFinalEventIds = [];
-      emitSnapshot('page_engagement', pageId, engagementPayload(), true, trigger || 'final');
-      emitSnapshot('page_performance', pageId, performancePayload(), true, trigger || 'final');
-      emitSnapshot('resource_summary', pageId, resourceSummaryPayload(), true, trigger || 'final');
+      try {
+        var event;
+        event = emitSnapshot('page_engagement', pageId, engagementPayload(), true, trigger || 'final', options);
+        if (event) {
+          ids.push(event.clientEventId);
+        }
+        event = emitSnapshot('page_performance', pageId, performancePayload(), true, trigger || 'final', options);
+        if (event) {
+          ids.push(event.clientEventId);
+        }
+        event = emitSnapshot('resource_summary', pageId, resourceSummaryPayload(), true, trigger || 'final', options);
+        if (event) {
+          ids.push(event.clientEventId);
+        }
+        completed = true;
+        return ids;
+      } finally {
+        if (deferred && !completed && ids.length) {
+          scheduleFlush();
+        }
+      }
     }
 
     function sendPageView() {
@@ -1756,6 +1920,7 @@
       if (lastPageViewUrl) {
         finalizePage('spa_navigation');
       }
+      ensureSession();
       lastPageViewUrl = key;
       if (isCodecId(pageViewId)) {
         previousPageViewId = pageViewId;
@@ -1993,9 +2158,7 @@
         link = link.parentNode;
       }
       capture();
-      if (link && link.href && !link.getAttribute('download') && stored) {
-        link.href = decorateUrl(link.href);
-      }
+      prepareActiveEventContext();
       markInteraction();
       clickCount += 1;
       var clickNode = node && (node.nodeType === 1 || node.tagName) ? node : node && node.parentElement;
@@ -2045,7 +2208,8 @@
         return;
       }
       capture();
-      ensureFormField(form);
+      rememberSubmitter(form, event.submitter || null);
+      prepareActiveEventContext();
       markInteraction();
       var fields = 0;
       try {
@@ -2074,13 +2238,29 @@
       )) || 0;
       var depthPct = documentHeight ? Math.min(100, ((scrollY + viewportHeight) / documentHeight) * 100) : 0;
       var depth = keepNumber(depthPct / 100);
+      var hasMilestone = false;
+      var i;
+      for (i = 0; i < SCROLL_MILESTONES.length; i++) {
+        if (depthPct >= SCROLL_MILESTONES[i] && !scrollMilestones[SCROLL_MILESTONES[i]]) {
+          hasMilestone = true;
+          break;
+        }
+      }
+      if (!hasMilestone) {
+        if (depthPct > maxScrollDepth) {
+          maxScrollDepth = depthPct;
+        }
+        lastScrollY = rawScrollY;
+        scrollCount += 1;
+        return;
+      }
+      prepareActiveEventContext();
       if (depthPct > maxScrollDepth) {
         maxScrollDepth = depthPct;
       }
       var direction = rawScrollY > lastScrollY ? 'down' : rawScrollY < lastScrollY ? 'up' : 'none';
       lastScrollY = rawScrollY;
       scrollCount += 1;
-      var i;
       for (i = 0; i < SCROLL_MILESTONES.length; i++) {
         var mark = SCROLL_MILESTONES[i];
         if (depthPct >= mark && !scrollMilestones[mark]) {
@@ -2140,6 +2320,7 @@
       if (!el || !el.tagName || (el.tagName !== 'VIDEO' && el.tagName !== 'AUDIO')) {
         return;
       }
+      prepareActiveEventContext();
       var action = event.type;
       var data = mediaPosition(el);
       data.action = action;
@@ -2181,6 +2362,7 @@
     }
 
     function onWindowError(event) {
+      prepareActiveEventContext();
       var path = normalizeScriptPath(event.filename || (event.error && event.error.fileName));
       emit('js_error', {
         errorType: 'error',
@@ -2192,6 +2374,7 @@
     }
 
     function onUnhandled(event) {
+      prepareActiveEventContext();
       emit('js_error', {
         errorType: 'unhandledrejection',
         errorFingerprint: errorFingerprint('unhandledrejection', '', 0, 0),
@@ -2202,7 +2385,9 @@
       tickEngagement();
       if (document.visibilityState === 'hidden') {
         var priorityIds = snapshotBackgroundOnce('hidden');
-        flush(true, priorityIds);
+        if (priorityIds.length) {
+          flush(true, priorityIds);
+        }
         return;
       }
       backgroundSnapshotPageViewId = '';
@@ -2216,11 +2401,29 @@
       tickEngagement();
       if (event && event.persisted === true) {
         var priorityIds = snapshotBackgroundOnce('pagehide_bfcache');
-        flush(true, priorityIds);
+        if (priorityIds.length) {
+          flush(true, priorityIds);
+        }
       } else {
-        finalizePage('pagehide');
-        flush(true);
+        var finalIds = finalizePage('pagehide', { deferAutoFlush: true });
+        if (finalIds.length) {
+          flush(true, finalIds);
+        }
       }
+    }
+
+    function onFormData(event) {
+      var form = event.target;
+      var submitter;
+      if (!form || form.nodeName !== 'FORM') {
+        return;
+      }
+      submitter = takeSubmitter(form);
+      capture();
+      if (!isSafeFormDestination(form, submitter)) {
+        return;
+      }
+      appendRqcid(event.formData);
     }
 
     function wrapHistory(method) {
@@ -2231,40 +2434,9 @@
       window.history[method] = function () {
         var result = original.apply(this, arguments);
         capture();
-        syncForms();
         sendPageView();
         return result;
       };
-    }
-
-    function observeForms() {
-      if (!window.MutationObserver) {
-        return;
-      }
-      try {
-        var obs = new window.MutationObserver(isolate(function (mutations) {
-          var i;
-          var j;
-          for (i = 0; i < mutations.length; i++) {
-            var added = mutations[i].addedNodes || [];
-            for (j = 0; j < added.length; j++) {
-              var node = added[j];
-              if (!node) continue;
-              if (node.nodeName === 'FORM') {
-                ensureFormField(node);
-              } else if (node.getElementsByTagName) {
-                var forms = node.getElementsByTagName('form');
-                var k;
-                for (k = 0; k < forms.length; k++) {
-                  ensureFormField(forms[k]);
-                }
-              }
-            }
-          }
-        }));
-        obs.observe(document.documentElement || document, { childList: true, subtree: true });
-        observers.push(obs);
-      } catch (e) {}
     }
 
     function paramFromSrc(src, name) {
@@ -2327,7 +2499,6 @@
       ensureVisitor();
       ensureSession();
       bind();
-      syncForms();
       flushPendingEvents();
       sendPageView();
     }
@@ -2339,6 +2510,7 @@
       bound = true;
       document.addEventListener('click', isolate(onClick), true);
       document.addEventListener('submit', isolate(onSubmit), true);
+      document.addEventListener('formdata', isolate(onFormData), true);
       document.addEventListener('scroll', isolate(onScroll), { capture: true, passive: true });
       document.addEventListener('play', isolate(onMedia), true);
       document.addEventListener('pause', isolate(onMedia), true);
@@ -2347,17 +2519,14 @@
       document.addEventListener('timeupdate', isolate(onMedia), true);
       window.addEventListener('popstate', isolate(function () {
         capture();
-        syncForms();
         sendPageView();
       }));
       window.addEventListener('hashchange', isolate(function () {
         capture();
-        syncForms();
         sendPageView();
       }));
       window.addEventListener('pageshow', isolate(function (event) {
         capture();
-        syncForms();
         if (event && event.persisted === true) {
           backgroundSnapshotPageViewId = '';
           visibleOn = perfNow();
@@ -2376,10 +2545,6 @@
       window.addEventListener('unhandledrejection', isolate(onUnhandled));
       wrapHistory('pushState');
       wrapHistory('replaceState');
-      if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', isolate(syncForms));
-      }
-      observeForms();
       observeVitals();
     }
 
@@ -2403,6 +2568,7 @@
           custom = undefined;
         }
       }
+      prepareActiveEventContext();
       emit(String(name), { custom: custom });
     }
 
@@ -2476,7 +2642,6 @@
     }
 
     bind();
-    syncForms();
     captureAttribution();
     ensureVisitor();
     ensureSession();
