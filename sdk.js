@@ -102,6 +102,8 @@
     var snapshotRevisions = {};
     var rqcidCapturedAtMs = 0;
     var formSubmitters = new WeakMap();
+    var formDataProxy = null;
+    var programmaticForms = [];
     var memoryQueue = [];
     var inflight = false;
     var flushTimer = 0;
@@ -112,7 +114,7 @@
     var lastFinalEventIds = [];
     var finalizedPageViewId = '';
     var backgroundSnapshotPageViewId = '';
-    var diagnostics = { rejectedEvents: 0, lastRejectReason: '', keepaliveAttempts: 0, invalidIdbEvents: 0 };
+    var diagnostics = { rejectedEvents: 0, lastRejectReason: '', keepaliveAttempts: 0, invalidIdbEvents: 0, formDataGuard: '' };
     var consentState = { analytics: 'unknown', updatedAtMs: 0, policyVersion: '' };
     var landingPath = '';
     var landingOrigin = '';
@@ -520,37 +522,83 @@
       return target.origin === page.origin;
     }
 
-    function rememberSubmitter(form, submitter) {
-      var token = submitter || null;
+    // Real user input runs a microtask checkpoint between `submit` and `formdata`,
+    // so the record lives until the next `formdata`/`submit` of that form instead.
+    function rememberSubmitter(form, event) {
       try {
-        formSubmitters.set(form, token);
-      } catch (e) {
-        return;
-      }
-      if (typeof queueMicrotask !== 'function') {
-        return;
-      }
-      queueMicrotask(function () {
-        try {
-          if (formSubmitters.get(form) === token) {
-            formSubmitters.delete(form);
-          }
-        } catch (e2) {}
-      });
+        formSubmitters.set(form, { event: event, submitter: event.submitter || null });
+      } catch (e) {}
     }
 
     function takeSubmitter(form) {
-      var value;
+      var record;
       try {
-        if (!formSubmitters.has(form)) {
-          return null;
-        }
-        value = formSubmitters.get(form);
+        record = formSubmitters.get(form);
         formSubmitters.delete(form);
-        return value;
       } catch (e) {
         return null;
       }
+      if (!record || record.event.defaultPrevented) {
+        return null;
+      }
+      return record.submitter;
+    }
+
+    // Native submission builds its entry list without calling the page's FormData
+    // constructor; only `new FormData(form)` goes through this trap.
+    function installFormDataGuard() {
+      var Original = window.FormData;
+      var wrapped;
+      if (formDataProxy) {
+        return;
+      }
+      if (typeof Original !== 'function' || typeof Proxy !== 'function' || typeof Reflect !== 'object' || !Reflect) {
+        diagnostics.formDataGuard = 'unsupported';
+        return;
+      }
+      try {
+        wrapped = new Proxy(Original, {
+          construct: function (target, args, newTarget) {
+            programmaticForms.push(args.length ? args[0] : null);
+            try {
+              return Reflect.construct(target, args, newTarget);
+            } finally {
+              programmaticForms.pop();
+            }
+          },
+        });
+        window.FormData = wrapped;
+      } catch (e) {
+        diagnostics.formDataGuard = 'failed';
+        return;
+      }
+      if (window.FormData !== wrapped) {
+        diagnostics.formDataGuard = 'failed';
+        return;
+      }
+      formDataProxy = wrapped;
+      diagnostics.formDataGuard = 'installed';
+    }
+
+    function isProgrammaticFormData(form) {
+      var i;
+      for (i = programmaticForms.length - 1; i >= 0; i--) {
+        if (programmaticForms[i] === form) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    function formDataGuardActive() {
+      if (!formDataProxy) {
+        return false;
+      }
+      if (window.FormData !== formDataProxy) {
+        diagnostics.formDataGuard = 'replaced';
+        return false;
+      }
+      return true;
     }
 
     function appendRqcid(data) {
@@ -2208,7 +2256,7 @@
         return;
       }
       capture();
-      rememberSubmitter(form, event.submitter || null);
+      rememberSubmitter(form, event);
       prepareActiveEventContext();
       markInteraction();
       var fields = 0;
@@ -2418,9 +2466,12 @@
       if (!form || form.nodeName !== 'FORM') {
         return;
       }
+      if (isProgrammaticFormData(form)) {
+        return;
+      }
       submitter = takeSubmitter(form);
       capture();
-      if (!isSafeFormDestination(form, submitter)) {
+      if (!formDataGuardActive() || !isSafeFormDestination(form, submitter)) {
         return;
       }
       appendRqcid(event.formData);
@@ -2510,6 +2561,7 @@
       bound = true;
       document.addEventListener('click', isolate(onClick), true);
       document.addEventListener('submit', isolate(onSubmit), true);
+      installFormDataGuard();
       document.addEventListener('formdata', isolate(onFormData), true);
       document.addEventListener('scroll', isolate(onScroll), { capture: true, passive: true });
       document.addEventListener('play', isolate(onMedia), true);

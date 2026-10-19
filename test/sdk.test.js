@@ -324,6 +324,7 @@ function createEnv(opts) {
       },
     },
     indexedDB: { open: idb.open.bind(idb) },
+    FormData: opts.noFormData ? undefined : FakeFormData,
     MutationObserver: function (fn) {
       this.observe = function () {};
     },
@@ -408,8 +409,24 @@ function createEnv(opts) {
     clearTimeout: windowObj.clearTimeout,
     console,
   };
+  if (opts.noProxy) sandbox.Proxy = undefined;
 
-  vm.runInNewContext(SOURCE, sandbox);
+  vm.createContext(sandbox);
+  vm.runInContext(SOURCE, sandbox);
+
+  // Mirrors the browser: new FormData(form) fires `formdata` synchronously inside the constructor.
+  function FakeFormData(form, submitter) {
+    if (!new.target) throw new TypeError("Failed to construct 'FormData': Please use the 'new' operator");
+    if (form !== undefined && !(form && form.nodeName === 'FORM')) {
+      throw new TypeError("Failed to construct 'FormData': parameter 1 is not of type 'HTMLFormElement'.");
+    }
+    if (submitter != null && submitter.nodeName !== 'BUTTON' && submitter.nodeName !== 'INPUT') {
+      throw new TypeError("Failed to construct 'FormData': The specified element is not a submit button.");
+    }
+    const data = makeFormData(form && form._entries);
+    Object.assign(this, data);
+    if (form) dispatch('formdata', form, { formData: this });
+  }
 
   function dispatch(type, target, extra) {
     const event = Object.assign(
@@ -429,6 +446,7 @@ function createEnv(opts) {
       extra || {}
     );
     (listeners[type] || []).forEach((fn) => fn(event));
+    return event;
   }
 
   async function drain(maxMs) {
@@ -473,6 +491,10 @@ function createEnv(opts) {
     history,
     dispatch,
     drain,
+    rerun() {
+      vm.runInContext(SOURCE, sandbox);
+    },
+    FakeFormData,
     setFetch(fn) {
       fetchImpl = fn;
     },
@@ -4171,6 +4193,176 @@ async function run() {
     assert.strictEqual(submitForm(empty, actionForm(empty, '/order')).count('rqcid'), 0);
     await empty.drain();
     assert.ok(ofType(empty, 'page_view').length >= 1);
+  });
+
+  function submitButton(env, formaction) {
+    const button = env.document.createElement('button');
+    button.setAttribute('type', 'submit');
+    if (formaction != null) button.setAttribute('formaction', formaction);
+    return button;
+  }
+
+  async function userSubmit(env, form, submitter, entries) {
+    const data = makeFormData(entries);
+    const event = env.dispatch('submit', form, { submitter: submitter || null, defaultPrevented: false });
+    await Promise.resolve();
+    await Promise.resolve();
+    env.dispatch('formdata', form, { formData: data });
+    return { data, event };
+  }
+
+  await test('F11 programmatic FormData of a same-origin form gets no SDK rqcid', async () => {
+    const env = await load();
+    const form = actionForm(env, '/order', 'post');
+    form._entries = [['productId', '123']];
+    const data = new env.window.FormData(form);
+    assert.strictEqual(data.count('rqcid'), 0);
+    assert.strictEqual(data.get('productId'), '123');
+    assert.strictEqual(form.elements.length, 0);
+    assert.strictEqual(submitForm(env, form, null, [['productId', '123']]).get('rqcid'), 'abcdefghijkl');
+  });
+
+  await test('FormData built inside a submit listener stays clean, native submission keeps rqcid', async () => {
+    const env = await load();
+    const form = actionForm(env, '/order', 'post');
+    form._entries = [['productId', '1']];
+    const local = submitButton(env, '/local-order');
+    let ajax = null;
+    env.document.addEventListener('submit', () => {
+      ajax = new env.window.FormData(form);
+    });
+    const { data } = await userSubmit(env, form, local, [['productId', '1']]);
+    assert.strictEqual(ajax.count('rqcid'), 0);
+    assert.strictEqual(data.get('rqcid'), 'abcdefghijkl');
+    const prevented = actionForm(env, '/order', 'post');
+    let cancelled = null;
+    env.document.addEventListener('submit', (event) => {
+      if (event.target !== prevented) return;
+      event.defaultPrevented = true;
+      cancelled = new env.window.FormData(prevented);
+    });
+    env.dispatch('submit', prevented, { submitter: null, defaultPrevented: false });
+    assert.strictEqual(cancelled.count('rqcid'), 0);
+  });
+
+  await test('nested, repeated and subclassed FormData construction stay clean', async () => {
+    const env = await load();
+    const outer = actionForm(env, '/order', 'post');
+    const inner = actionForm(env, '/inner', 'post');
+    let innerData = null;
+    env.document.addEventListener('formdata', (event) => {
+      if (event.target === outer && !innerData) innerData = new env.window.FormData(inner);
+    });
+    const outerData = new env.window.FormData(outer);
+    assert.strictEqual(outerData.count('rqcid'), 0);
+    assert.strictEqual(innerData.count('rqcid'), 0);
+    for (let i = 0; i < 3; i += 1) {
+      assert.strictEqual(new env.window.FormData(outer).count('rqcid'), 0);
+    }
+    const withSubmitter = new env.window.FormData(outer, submitButton(env, '/order'));
+    assert.strictEqual(withSubmitter.count('rqcid'), 0);
+    class AppFormData extends env.window.FormData {}
+    const sub = new AppFormData(outer);
+    assert.ok(sub instanceof AppFormData);
+    assert.ok(sub instanceof env.window.FormData);
+    assert.strictEqual(sub.count('rqcid'), 0);
+    assert.strictEqual(new env.window.FormData().count('rqcid'), 0);
+    assert.strictEqual(submitForm(env, outer).count('rqcid'), 1);
+    assert.strictEqual(submitForm(env, inner).count('rqcid'), 1);
+  });
+
+  await test('native submit inside FormData construction of another form still injects', async () => {
+    const env = await load();
+    const ajaxForm = actionForm(env, '/ajax', 'post');
+    const nativeForm = actionForm(env, '/order', 'post');
+    let nativeData = null;
+    env.document.addEventListener('formdata', (event) => {
+      if (event.target === ajaxForm && !nativeData) nativeData = submitForm(env, nativeForm);
+    });
+    assert.strictEqual(new env.window.FormData(ajaxForm).count('rqcid'), 0);
+    assert.strictEqual(nativeData.get('rqcid'), 'abcdefghijkl');
+  });
+
+  await test('FormData constructor errors clear the programmatic context', async () => {
+    const env = await load();
+    const form = actionForm(env, '/order', 'post');
+    assert.throws(() => new env.window.FormData({}), TypeError);
+    assert.throws(() => new env.window.FormData(form, { nodeName: 'DIV' }), TypeError);
+    assert.throws(() => env.window.FormData(form), TypeError);
+    assert.strictEqual(submitForm(env, form).get('rqcid'), 'abcdefghijkl');
+    assert.strictEqual(programmaticFormSubmit(env, form).get('rqcid'), 'abcdefghijkl');
+  });
+
+  await test('developer-owned rqcid survives programmatic and native FormData', async () => {
+    const env = await load();
+    const form = actionForm(env, '/order', 'post');
+    form._entries = [['rqcid', 'devowned1234']];
+    const ajax = new env.window.FormData(form);
+    assert.deepStrictEqual(ajax.list, [['rqcid', 'devowned1234']]);
+    const native = submitForm(env, form, null, [['rqcid', 'devowned1234']]);
+    assert.deepStrictEqual(native.list, [['rqcid', 'devowned1234']]);
+  });
+
+  await test('submitter survives the microtask checkpoint of a real user submit', async () => {
+    const env = await load();
+    const local = actionForm(env, '/order', 'post');
+    const leaked = await userSubmit(env, local, submitButton(env, 'https://external.example/order'));
+    assert.strictEqual(leaked.data.count('rqcid'), 0);
+    const external = actionForm(env, 'https://external.example/order', 'post');
+    const kept = await userSubmit(env, external, submitButton(env, '/local-order'));
+    assert.strictEqual(kept.data.get('rqcid'), 'abcdefghijkl');
+    const enter = await userSubmit(env, local, submitButton(env));
+    assert.strictEqual(enter.data.get('rqcid'), 'abcdefghijkl');
+    const getForm = actionForm(env, '/search', 'get');
+    assert.strictEqual((await userSubmit(env, getForm, submitButton(env, 'https://external.example/s'))).data.count('rqcid'), 0);
+  });
+
+  await test('cancelled submit does not leave its submitter for a later form.submit()', async () => {
+    const env = await load();
+    const external = actionForm(env, 'https://external.example/order', 'post');
+    const event = env.dispatch('submit', external, { submitter: submitButton(env, '/local-order'), defaultPrevented: false });
+    event.defaultPrevented = true;
+    await Promise.resolve();
+    assert.strictEqual(programmaticFormSubmit(env, external).count('rqcid'), 0);
+    const local = actionForm(env, '/order', 'post');
+    const again = env.dispatch('submit', local, { submitter: submitButton(env, 'https://external.example/order'), defaultPrevented: false });
+    again.defaultPrevented = true;
+    assert.strictEqual(programmaticFormSubmit(env, local).get('rqcid'), 'abcdefghijkl');
+    const used = actionForm(env, 'https://external.example/order', 'post');
+    await userSubmit(env, used, submitButton(env, '/local-order'));
+    assert.strictEqual(programmaticFormSubmit(env, used).count('rqcid'), 0);
+  });
+
+  await test('FormData guard is installed once and keeps native behaviour on re-run', async () => {
+    const env = await load();
+    const wrapped = env.window.FormData;
+    assert.strictEqual(typeof wrapped, 'function');
+    assert.notStrictEqual(wrapped, env.FakeFormData);
+    assert.strictEqual(wrapped.prototype, env.FakeFormData.prototype);
+    assert.ok(new wrapped() instanceof env.FakeFormData);
+    env.rerun();
+    env.window.RefIQ.init({ siteKey: 'site_test' });
+    assert.strictEqual(env.window.FormData, wrapped);
+    const form = actionForm(env, '/order', 'post');
+    assert.strictEqual(submitForm(env, form).count('rqcid'), 1);
+    assert.strictEqual(new env.window.FormData(form).count('rqcid'), 0);
+    assert.strictEqual(env.window.RefIQ._diagnostics.formDataGuard, 'installed');
+  });
+
+  await test('without a FormData guard the SDK does not inject rqcid', async () => {
+    for (const opts of [{ noProxy: true }, { noFormData: true }]) {
+      const env = await load(opts);
+      const form = actionForm(env, '/order', 'post');
+      assert.strictEqual(submitForm(env, form).count('rqcid'), 0, JSON.stringify(opts));
+      assert.strictEqual(env.window.RefIQ.getRqcid(), 'abcdefghijkl');
+      assert.strictEqual(env.window.RefIQ._diagnostics.formDataGuard, 'unsupported');
+      await env.drain();
+      assert.ok(ofType(env, 'form_submit').length >= 1);
+    }
+    const replaced = await load();
+    replaced.window.FormData = function OtherFormData() {};
+    assert.strictEqual(submitForm(replaced, actionForm(replaced, '/order')).count('rqcid'), 0);
+    assert.strictEqual(replaced.window.RefIQ._diagnostics.formDataGuard, 'replaced');
   });
 
   console.log('\n' + passed + ' tests passed');
