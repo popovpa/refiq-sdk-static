@@ -36,7 +36,7 @@
     var KEY = 'rqcid';
     var EVENTS_URL = '__REFIQ_CS_BACKEND_URL__';
     var COOKIE_MAX_AGE = 31536000;
-    var SDK_VERSION = '2.0.0';
+    var SDK_VERSION = '2.0.1';
     var SCHEMA_VERSION = 1;
     var FLUSH_INTERVAL_MS = 5000;
     var MAX_EVENTS_PER_BATCH = 20;
@@ -76,6 +76,7 @@
     var ATTR_KEY = '_refiq_attr';
     var RQCID_META_KEY = '_refiq_rqcid_meta';
     var CONSENT_KEY = '_refiq_consent';
+    var NATIVE_SUBMIT_KEY = '__refiqNativeSubmit';
     var IDB_NAME = 'refiq_cs';
     var IDB_STORE = 'q';
     var IDB_VERSION = 1;
@@ -101,9 +102,8 @@
     var pageSnapshots = {};
     var snapshotRevisions = {};
     var rqcidCapturedAtMs = 0;
-    var formSubmitters = new WeakMap();
-    var formDataProxy = null;
-    var programmaticForms = [];
+    var sdkFields = new WeakMap();
+    var submitValidity = new WeakMap();
     var memoryQueue = [];
     var inflight = false;
     var flushTimer = 0;
@@ -114,7 +114,7 @@
     var lastFinalEventIds = [];
     var finalizedPageViewId = '';
     var backgroundSnapshotPageViewId = '';
-    var diagnostics = { rejectedEvents: 0, lastRejectReason: '', keepaliveAttempts: 0, invalidIdbEvents: 0, formDataGuard: '' };
+    var diagnostics = { rejectedEvents: 0, lastRejectReason: '', keepaliveAttempts: 0, invalidIdbEvents: 0 };
     var consentState = { analytics: 'unknown', updatedAtMs: 0, policyVersion: '' };
     var landingPath = '';
     var landingOrigin = '';
@@ -522,93 +522,96 @@
       return target.origin === page.origin;
     }
 
-    // Real user input runs a microtask checkpoint between `submit` and `formdata`,
-    // so the record lives until the next `formdata`/`submit` of that form instead.
-    function rememberSubmitter(form, event) {
-      try {
-        formSubmitters.set(form, { event: event, submitter: event.submitter || null });
-      } catch (e) {}
+    function isDialogSubmission(form, submitter) {
+      var method = attributeValue(submitter, 'formmethod');
+      if (method == null) {
+        method = attributeValue(form, 'method');
+      }
+      return String(method || '').toLowerCase() === 'dialog';
     }
 
-    function takeSubmitter(form) {
-      var record;
-      try {
-        record = formSubmitters.get(form);
-        formSubmitters.delete(form);
-      } catch (e) {
-        return null;
-      }
-      if (!record || record.event.defaultPrevented) {
-        return null;
-      }
-      return record.submitter;
+    function skipsValidation(form, submitter) {
+      return attributeValue(form, 'novalidate') != null || attributeValue(submitter, 'formnovalidate') != null;
     }
 
-    // Native submission builds its entry list without calling the page's FormData
-    // constructor; only `new FormData(form)` goes through this trap.
-    function installFormDataGuard() {
-      var Original = window.FormData;
-      var wrapped;
-      if (formDataProxy) {
-        return;
-      }
-      if (typeof Original !== 'function' || typeof Proxy !== 'function' || typeof Reflect !== 'object' || !Reflect) {
-        diagnostics.formDataGuard = 'unsupported';
-        return;
-      }
-      try {
-        wrapped = new Proxy(Original, {
-          construct: function (target, args, newTarget) {
-            programmaticForms.push(args.length ? args[0] : null);
-            try {
-              return Reflect.construct(target, args, newTarget);
-            } finally {
-              programmaticForms.pop();
-            }
-          },
-        });
-        window.FormData = wrapped;
-      } catch (e) {
-        diagnostics.formDataGuard = 'failed';
-        return;
-      }
-      if (window.FormData !== wrapped) {
-        diagnostics.formDataGuard = 'failed';
-        return;
-      }
-      formDataProxy = wrapped;
-      diagnostics.formDataGuard = 'installed';
-    }
-
-    function isProgrammaticFormData(form) {
+    function hasActiveRqcidControl(form) {
+      var controls;
       var i;
-      for (i = programmaticForms.length - 1; i >= 0; i--) {
-        if (programmaticForms[i] === form) {
-          return true;
+      try {
+        controls = form.elements;
+        for (i = 0; i < controls.length; i++) {
+          if (controls[i] && controls[i].name === KEY && !controls[i].disabled) {
+            return true;
+          }
         }
+      } catch (e) {
+        return true;
       }
       return false;
     }
 
-    function formDataGuardActive() {
-      if (!formDataProxy) {
-        return false;
+    function removeRqcidField(form, field) {
+      var own = sdkFields.get(form);
+      if (!own || (field && own !== field)) {
+        return;
       }
-      if (window.FormData !== formDataProxy) {
-        diagnostics.formDataGuard = 'replaced';
-        return false;
+      sdkFields.delete(form);
+      if (own.parentNode) {
+        own.parentNode.removeChild(own);
       }
-      return true;
     }
 
-    function appendRqcid(data) {
-      if (!data || typeof data.append !== 'function' || !isRqcid(stored)) {
+    // The field must exist only while the browser builds the native entry list:
+    // `formdata` removes it right after; the timer covers submissions that never
+    // reach `formdata`. A microtask is too early: user input runs one before it.
+    function addRqcidField(form, submitter) {
+      var field;
+      removeRqcidField(form);
+      if (!form || form.nodeName !== 'FORM') {
         return;
       }
-      if (typeof data.has === 'function' && data.has(KEY)) {
+      capture();
+      if (!isRqcid(stored) || isDialogSubmission(form, submitter) || !isSafeFormDestination(form, submitter)) {
         return;
       }
-      data.append(KEY, stored);
+      if (hasActiveRqcidControl(form)) {
+        return;
+      }
+      field = (form.ownerDocument || document).createElement('input');
+      field.type = 'hidden';
+      field.name = KEY;
+      field.value = stored;
+      form.appendChild(field);
+      sdkFields.set(form, field);
+      window.setTimeout(isolate(function () {
+        removeRqcidField(form, field);
+      }), 0);
+    }
+
+    function wrapFormSubmit() {
+      var proto = window.HTMLFormElement && window.HTMLFormElement.prototype;
+      var nativeSubmit;
+      var wrapped;
+      if (!proto || typeof proto.submit !== 'function' || proto.submit[NATIVE_SUBMIT_KEY]) {
+        return;
+      }
+      nativeSubmit = proto.submit;
+      wrapped = function submit() {
+        try {
+          addRqcidField(this, null);
+        } catch (e) {}
+        try {
+          return nativeSubmit.apply(this, arguments);
+        } finally {
+          try {
+            removeRqcidField(this);
+          } catch (e2) {}
+        }
+      };
+      try {
+        Object.defineProperty(wrapped, NATIVE_SUBMIT_KEY, { value: nativeSubmit });
+        proto.submit = wrapped;
+      } catch (e) {}
     }
 
     function hashRoute() {
@@ -2164,6 +2167,617 @@
       });
     }
 
+    // Identity is scoped to site_id + page + page_view_id. It is not a global id.
+    // data-refiq-id and HTML id must be unique among logical controls on the page.
+    // A dom-path key repeats only while element structure is unchanged. SPA re-renders,
+    // redesigns and inserted siblings change it. Strings stay under the Tracker 2048 limit.
+    var ELEMENT_ID_MAX = 64;
+    var DOM_PATH_MAX_DEPTH = 12;
+    var DOM_PATH_MAX_LENGTH = 512;
+    var DOM_PATH_MAX_SIBLINGS = 48;
+    var INTERACTIVE_MAX_WALK = 24;
+    var INTERACTIVE_ROLES = { button: 1, link: 1, checkbox: 1, radio: 1, switch: 1, tab: 1, menuitem: 1 };
+    var SEMANTIC_ROLES = { cta: 1, navigation: 1, search: 1, checkout: 1 };
+    var EXPLICIT_ID_RE = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+    var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    var LONG_HEX_RE = /^[0-9a-f]{16,}$/i;
+    var LONG_DIGITS_RE = /\d{8,}/;
+
+    function readAttr(el, name) {
+      try {
+        return attributeValue(el, name);
+      } catch (e) {
+        return null;
+      }
+    }
+
+    function isElement(node) {
+      if (!node || node === window || node === document) {
+        return false;
+      }
+      var type;
+      var name;
+      try {
+        type = node.nodeType;
+      } catch (e) {
+        return false;
+      }
+      if (type === 3 || type === 4 || type === 8 || type === 9 || type === 11) {
+        return false;
+      }
+      if (type != null && type !== 1) {
+        return false;
+      }
+      try {
+        name = node.tagName || node.nodeName;
+      } catch (e2) {
+        return false;
+      }
+      return !!name && name !== '#document' && name !== '#document-fragment' && name !== '#text';
+    }
+
+    function sameDocument(node) {
+      try {
+        if (!node || node === window || node === document) {
+          return node === document || node === window;
+        }
+        if (node.ownerDocument && node.ownerDocument !== document) {
+          return false;
+        }
+        return true;
+      } catch (e) {
+        return false;
+      }
+    }
+
+    function nodeKind(el) {
+      try {
+        return String(el.nodeName || el.tagName || '').toUpperCase();
+      } catch (e) {
+        return '';
+      }
+    }
+
+    function tagNameOf(el) {
+      var raw;
+      try {
+        raw = el.tagName || el.nodeName || '';
+      } catch (e) {
+        return '';
+      }
+      raw = String(raw).toLowerCase();
+      return /^[a-z][a-z0-9-]*$/.test(raw) ? raw : '';
+    }
+
+    function asElement(node) {
+      if (isElement(node)) {
+        return node;
+      }
+      var type;
+      var parent;
+      try {
+        type = node && node.nodeType;
+      } catch (e) {
+        return null;
+      }
+      if (type !== 3 && type !== 4) {
+        return null;
+      }
+      try {
+        parent = node.parentElement || node.parentNode || null;
+      } catch (e2) {
+        return null;
+      }
+      return isElement(parent) ? parent : null;
+    }
+
+    function interactiveRole(el) {
+      var raw = readAttr(el, 'role');
+      var token;
+      if (raw == null) {
+        return '';
+      }
+      token = String(raw).trim().toLowerCase().split(/\s+/)[0];
+      return Object.prototype.hasOwnProperty.call(INTERACTIVE_ROLES, token) ? token : '';
+    }
+
+    function hasHref(el) {
+      if (readAttr(el, 'href') != null) {
+        return true;
+      }
+      try {
+        return !!(el && el.href);
+      } catch (e) {
+        return false;
+      }
+    }
+
+    function isInteractive(el) {
+      var name = nodeKind(el);
+      if (!name) {
+        return false;
+      }
+      if (name === 'BUTTON' || name === 'INPUT' || name === 'SELECT' || name === 'TEXTAREA' || name === 'SUMMARY') {
+        return true;
+      }
+      if (name === 'A' && hasHref(el)) {
+        return true;
+      }
+      if (interactiveRole(el)) {
+        return true;
+      }
+      if (name === 'FORM' || name === 'BODY' || name === 'HTML') {
+        return false;
+      }
+      return !!(readAttr(el, 'data-refiq-id') || readAttr(el, 'data-refiq-role'));
+    }
+
+    function parentStep(el) {
+      var parent;
+      try {
+        parent = el.parentNode || el.parentElement || null;
+      } catch (e) {
+        return undefined;
+      }
+      if (!parent || parent === document) {
+        return null;
+      }
+      try {
+        if (parent.nodeType === 9) {
+          return null;
+        }
+        if (parent.nodeType === 11 || parent.nodeName === '#document-fragment') {
+          if (parent.host && isElement(parent.host) && sameDocument(parent.host)) {
+            return { node: parent.host, shadow: true };
+          }
+          return undefined;
+        }
+      } catch (e2) {
+        return undefined;
+      }
+      if (!isElement(parent) || !sameDocument(parent)) {
+        return parent && !sameDocument(parent) ? undefined : null;
+      }
+      return { node: parent, shadow: false };
+    }
+
+    function resolveInteractiveElement(event) {
+      var path = null;
+      var fromPath;
+      if (!event) {
+        return null;
+      }
+      try {
+        if (typeof event.composedPath === 'function') {
+          path = event.composedPath();
+        }
+      } catch (e) {
+        path = null;
+      }
+      if (path && path.length) {
+        fromPath = firstInteractive(path);
+        return fromPath;
+      }
+      return walkInteractive(event.target);
+    }
+
+    function firstInteractive(path) {
+      var i;
+      var walked = 0;
+      for (i = 0; i < path.length && walked < INTERACTIVE_MAX_WALK; i++) {
+        var node = path[i];
+        var type;
+        var el;
+        if (!node || node === window || node === document) {
+          break;
+        }
+        try {
+          type = node.nodeType;
+        } catch (e) {
+          break;
+        }
+        if (type === 11) {
+          continue;
+        }
+        if (type === 9) {
+          break;
+        }
+        el = asElement(node);
+        if (!el) {
+          continue;
+        }
+        if (!sameDocument(el)) {
+          break;
+        }
+        walked++;
+        try {
+          if (isInteractive(el)) {
+            return el;
+          }
+        } catch (e2) {}
+      }
+      return null;
+    }
+
+    function walkInteractive(start) {
+      var current = start;
+      var depth = 0;
+      var seen = [];
+      while (current && depth < INTERACTIVE_MAX_WALK) {
+        var i;
+        var type;
+        var el;
+        var step;
+        if (current === window || current === document) {
+          break;
+        }
+        for (i = 0; i < seen.length; i++) {
+          if (seen[i] === current) {
+            return null;
+          }
+        }
+        seen.push(current);
+        try {
+          type = current.nodeType;
+        } catch (e) {
+          break;
+        }
+        if (type === 11) {
+          try {
+            current = current.host || null;
+          } catch (e2) {
+            break;
+          }
+          depth++;
+          continue;
+        }
+        if (type === 9) {
+          break;
+        }
+        el = asElement(current);
+        if (!el || !sameDocument(el)) {
+          break;
+        }
+        try {
+          if (isInteractive(el)) {
+            return el;
+          }
+        } catch (e3) {}
+        step = parentStep(el);
+        if (!step) {
+          break;
+        }
+        current = step.node;
+        depth++;
+      }
+      return null;
+    }
+
+    function safeExplicitId(raw) {
+      var value;
+      if (raw == null) {
+        return '';
+      }
+      value = String(raw).trim();
+      if (!value || value.length > ELEMENT_ID_MAX || !EXPLICIT_ID_RE.test(value)) {
+        return '';
+      }
+      if (UUID_RE.test(value) || LONG_HEX_RE.test(value) || LONG_DIGITS_RE.test(value)) {
+        return '';
+      }
+      return value;
+    }
+
+    function readElementId(el) {
+      var fromAttr = readAttr(el, 'id');
+      if (fromAttr != null && String(fromAttr).trim() !== '') {
+        return String(fromAttr);
+      }
+      try {
+        if (typeof el.id === 'string' && el.id) {
+          return el.id;
+        }
+      } catch (e) {}
+      return '';
+    }
+
+    function previousElement(el) {
+      var sib;
+      var guard;
+      try {
+        if (el && typeof el.previousElementSibling !== 'undefined') {
+          return el.previousElementSibling || null;
+        }
+      } catch (e) {
+        return undefined;
+      }
+      try {
+        sib = el.previousSibling || null;
+      } catch (e2) {
+        return undefined;
+      }
+      guard = 0;
+      while (sib && guard < DOM_PATH_MAX_SIBLINGS + 1) {
+        if (isElement(sib)) {
+          return sib;
+        }
+        try {
+          sib = sib.previousSibling || null;
+        } catch (e3) {
+          return undefined;
+        }
+        guard++;
+      }
+      return sib ? undefined : null;
+    }
+
+    function sameTagIndex(el) {
+      var tag = tagNameOf(el);
+      var count = 1;
+      var steps = 0;
+      var sib;
+      if (!tag) {
+        return -1;
+      }
+      if (tag === 'html' || tag === 'body') {
+        return 0;
+      }
+      sib = previousElement(el);
+      if (sib === undefined) {
+        return -1;
+      }
+      while (sib) {
+        steps++;
+        if (steps > DOM_PATH_MAX_SIBLINGS) {
+          return -1;
+        }
+        if (tagNameOf(sib) === tag) {
+          count++;
+        }
+        sib = previousElement(sib);
+        if (sib === undefined) {
+          return -1;
+        }
+      }
+      return count;
+    }
+
+    function buildDomPath(element) {
+      var parts = [];
+      var current = element;
+      var depth = 0;
+      var seen = [];
+      while (current && isElement(current)) {
+        var s;
+        var index;
+        var tag;
+        var step;
+        if (depth >= DOM_PATH_MAX_DEPTH) {
+          return '';
+        }
+        for (s = 0; s < seen.length; s++) {
+          if (seen[s] === current) {
+            return '';
+          }
+        }
+        seen.push(current);
+        index = sameTagIndex(current);
+        tag = tagNameOf(current);
+        if (index < 0 || !tag) {
+          return '';
+        }
+        step = parentStep(current);
+        if (step === undefined) {
+          return '';
+        }
+        parts.push({
+          key: index === 0 ? tag : tag + ':nth-of-type(' + index + ')',
+          sep: step && step.shadow ? '>>' : '>',
+        });
+        depth++;
+        if (!step) {
+          break;
+        }
+        current = step.node;
+      }
+      if (!parts.length) {
+        return '';
+      }
+      var out = parts[parts.length - 1].key;
+      var i;
+      for (i = parts.length - 2; i >= 0; i--) {
+        out += parts[i].sep + parts[i].key;
+      }
+      if (!out || out.length > DOM_PATH_MAX_LENGTH) {
+        return '';
+      }
+      return out;
+    }
+
+    function buildElementIdentity(element) {
+      var marked;
+      var htmlId;
+      var path;
+      var empty = { elementKey: '', identitySource: '' };
+      try {
+        if (!isElement(element)) {
+          return empty;
+        }
+        marked = safeExplicitId(readAttr(element, 'data-refiq-id'));
+        if (marked) {
+          return { elementKey: marked, identitySource: 'data-refiq-id' };
+        }
+        htmlId = safeExplicitId(readElementId(element));
+        if (htmlId) {
+          return { elementKey: htmlId, identitySource: 'id' };
+        }
+        path = buildDomPath(element);
+        if (path) {
+          return { elementKey: path, identitySource: 'dom-path' };
+        }
+      } catch (e) {}
+      return empty;
+    }
+
+    function associatedForm(el) {
+      var explicit;
+      var found;
+      var name;
+      var current;
+      var depth;
+      var step;
+      try {
+        if (el.form && nodeKind(el.form) === 'FORM' && sameDocument(el.form)) {
+          return el.form;
+        }
+      } catch (e) {}
+      explicit = readAttr(el, 'form');
+      if (explicit != null) {
+        try {
+          if (document.getElementById) {
+            found = document.getElementById(explicit);
+            if (found && nodeKind(found) === 'FORM' && sameDocument(found)) {
+              return found;
+            }
+          }
+        } catch (e2) {}
+        return null;
+      }
+      name = nodeKind(el);
+      if (name !== 'BUTTON' && name !== 'INPUT' && name !== 'SELECT' && name !== 'TEXTAREA') {
+        return null;
+      }
+      current = el;
+      depth = 0;
+      while (current && depth < INTERACTIVE_MAX_WALK) {
+        step = parentStep(current);
+        if (!step || step.shadow) {
+          return null;
+        }
+        if (nodeKind(step.node) === 'FORM') {
+          return step.node;
+        }
+        current = step.node;
+        depth++;
+      }
+      return null;
+    }
+
+    function controlType(el, name) {
+      var value;
+      if (name !== 'BUTTON' && name !== 'INPUT') {
+        return '';
+      }
+      value = readAttr(el, 'type');
+      if (value == null || String(value).trim() === '') {
+        return name === 'INPUT' ? 'text' : '';
+      }
+      return String(value).trim().toLowerCase();
+    }
+
+    function actionTypeOf(el, name, role) {
+      var control = controlType(el, name);
+      if (control === 'checkbox' || control === 'radio' || role === 'checkbox' || role === 'radio' || role === 'switch') {
+        return 'toggle';
+      }
+      if (name === 'SUMMARY') {
+        return 'toggle';
+      }
+      if (name === 'BUTTON' || control === 'submit' || control === 'image' || control === 'button' || control === 'reset') {
+        if (control === 'reset') {
+          return '';
+        }
+        if (control === 'button') {
+          return 'custom';
+        }
+        if (control === 'submit' || control === 'image' || (name === 'BUTTON' && control === '')) {
+          return control === 'submit' || control === 'image' || associatedForm(el) ? 'submit' : 'custom';
+        }
+      }
+      if ((name === 'A' && hasHref(el)) || role === 'link') {
+        return 'navigate';
+      }
+      if (role === 'button') {
+        return 'custom';
+      }
+      return '';
+    }
+
+    function formIdOf(el) {
+      var form = associatedForm(el);
+      var marked;
+      if (!form) {
+        return '';
+      }
+      marked = safeExplicitId(readAttr(form, 'data-refiq-id'));
+      if (marked) {
+        return marked;
+      }
+      return safeExplicitId(readElementId(form));
+    }
+
+    function buildElementSemantics(element) {
+      var empty = { elementType: '', actionType: '', semanticRole: '', formId: '' };
+      var name;
+      var role;
+      var semantic;
+      try {
+        if (!isElement(element)) {
+          return empty;
+        }
+        name = nodeKind(element);
+        role = interactiveRole(element);
+        if (name === 'BUTTON') empty.elementType = 'button';
+        else if (name === 'A' && hasHref(element)) empty.elementType = 'link';
+        else if (name === 'INPUT') empty.elementType = 'input';
+        else if (name === 'SELECT') empty.elementType = 'select';
+        else if (name === 'TEXTAREA') empty.elementType = 'textarea';
+        else if (role === 'button') empty.elementType = 'button';
+        else if (role === 'link') empty.elementType = 'link';
+        else if (role === 'checkbox' || role === 'radio' || role === 'switch' || role === 'tab' || role === 'menuitem' || readAttr(element, 'data-refiq-id') || readAttr(element, 'data-refiq-role') || name.indexOf('-') !== -1) {
+          empty.elementType = 'custom';
+        }
+        empty.actionType = actionTypeOf(element, name, role);
+        semantic = readAttr(element, 'data-refiq-role');
+        if (semantic != null) {
+          semantic = String(semantic).trim();
+          if (semantic === semantic.toLowerCase() && Object.prototype.hasOwnProperty.call(SEMANTIC_ROLES, semantic)) {
+            empty.semanticRole = semantic;
+          }
+        }
+        empty.formId = formIdOf(element);
+      } catch (e) {}
+      return empty;
+    }
+
+    function attachInteractiveTarget(payload, event) {
+      var interactive;
+      var identity;
+      var semantics;
+      var target;
+      if (!payload) {
+        return;
+      }
+      interactive = resolveInteractiveElement(event);
+      if (!interactive) {
+        return;
+      }
+      identity = buildElementIdentity(interactive);
+      semantics = buildElementSemantics(interactive);
+      target = payload.target;
+      if (!target || typeof target !== 'object') {
+        return;
+      }
+      if (identity.elementKey) {
+        target.elementKey = identity.elementKey;
+        target.identitySource = identity.identitySource;
+      }
+      if (semantics.elementType) target.elementType = semantics.elementType;
+      if (semantics.actionType) target.actionType = semantics.actionType;
+      if (semantics.semanticRole) target.semanticRole = semantics.semanticRole;
+      if (semantics.formId) target.formId = semantics.formId;
+    }
+
     function targetMeta(node, link) {
       if (!node || !node.getAttribute) {
         return null;
@@ -2247,6 +2861,9 @@
       if (typeof event.width === 'number') payload.width = keepNumber(event.width);
       if (typeof event.height === 'number') payload.height = keepNumber(event.height);
       if (typeof event.isPrimary === 'boolean') payload.isPrimary = event.isPrimary;
+      try {
+        attachInteractiveTarget(payload, event);
+      } catch (ignoreIdentity) {}
       emit('click', payload);
     }
 
@@ -2256,19 +2873,41 @@
         return;
       }
       capture();
-      rememberSubmitter(form, event);
       prepareActiveEventContext();
       markInteraction();
       var fields = 0;
       try {
         fields = form.elements ? form.elements.length : 0;
       } catch (e) {}
+      var formId = (form.getAttribute && (form.getAttribute('data-refiq-id') || form.id)) || undefined;
+      var valid = form.checkValidity ? !!form.checkValidity() : undefined;
+      try {
+        submitValidity.set(event, valid);
+      } catch (e2) {}
       emit('form_submit', {
-        formId: (form.getAttribute && (form.getAttribute('data-refiq-id') || form.id)) || undefined,
+        formId: formId,
         fieldCount: toInteger(fields),
-        valid: form.checkValidity ? !!form.checkValidity() : undefined,
+        valid: valid,
         method: (form.method || 'get').toLowerCase(),
       });
+    }
+
+    // Bubble phase on window runs after the page's form/document submit handlers,
+    // so `action`, `formaction` and `preventDefault()` are already final.
+    function onSubmitAttribution(event) {
+      var form = event.target;
+      var submitter = event.submitter || null;
+      if (!form || form.nodeName !== 'FORM') {
+        return;
+      }
+      removeRqcidField(form);
+      if (event.defaultPrevented) {
+        return;
+      }
+      if (submitValidity.get(event) === false && !skipsValidation(form, submitter)) {
+        return;
+      }
+      addRqcidField(form, submitter);
     }
 
     function measureScroll() {
@@ -2460,21 +3099,14 @@
       }
     }
 
+    // `formdata` fires after the entry list is built, also for `new FormData(form)`;
+    // it never adds anything, it only drops the SDK-owned field.
     function onFormData(event) {
       var form = event.target;
-      var submitter;
       if (!form || form.nodeName !== 'FORM') {
         return;
       }
-      if (isProgrammaticFormData(form)) {
-        return;
-      }
-      submitter = takeSubmitter(form);
-      capture();
-      if (!formDataGuardActive() || !isSafeFormDestination(form, submitter)) {
-        return;
-      }
-      appendRqcid(event.formData);
+      removeRqcidField(form);
     }
 
     function wrapHistory(method) {
@@ -2561,8 +3193,9 @@
       bound = true;
       document.addEventListener('click', isolate(onClick), true);
       document.addEventListener('submit', isolate(onSubmit), true);
-      installFormDataGuard();
+      window.addEventListener('submit', isolate(onSubmitAttribution), false);
       document.addEventListener('formdata', isolate(onFormData), true);
+      wrapFormSubmit();
       document.addEventListener('scroll', isolate(onScroll), { capture: true, passive: true });
       document.addEventListener('play', isolate(onMedia), true);
       document.addEventListener('pause', isolate(onMedia), true);

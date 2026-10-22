@@ -194,23 +194,59 @@ function createEnv(opts) {
         appendChild(child) {
           this._inputs = this._inputs || [];
           this._inputs.push(child);
-          this.elements = this._inputs;
+          if (this.elements && this.elements !== this._inputs) this.elements.push(child);
+          else this.elements = this._inputs;
+          child.parentNode = this;
+          return child;
+        },
+        removeChild(child) {
+          [this._inputs, this.elements].forEach((list) => {
+            const idx = list ? list.indexOf(child) : -1;
+            if (idx !== -1) list.splice(idx, 1);
+          });
+          child.parentNode = null;
+          return child;
+        },
+        addEventListener(type, fn) {
+          this._listeners = this._listeners || {};
+          (this._listeners[type] = this._listeners[type] || []).push(fn);
         },
         getBoundingClientRect() {
           return { left: 10, top: 20, width: 100, height: 40 };
         },
       };
       if (tag === 'form') {
+        Object.setPrototypeOf(el, HTMLFormElement.prototype);
         el.elements = [];
         el.method = 'post';
         el.checkValidity = () => true;
       }
       return el;
     },
-    addEventListener(type, fn) {
-      (listeners[type] = listeners[type] || []).push(fn);
+    addEventListener(type, fn, options) {
+      listen('document', type, fn, options);
     },
   };
+
+  const listenerPhase = new Map();
+  function listen(owner, type, fn, options) {
+    const capture = options === true || !!(options && options.capture);
+    listenerPhase.set(fn, { owner, capture });
+    (listeners[type] = listeners[type] || []).push(fn);
+  }
+
+  const nativeSubmissions = [];
+  function HTMLFormElement() {
+    throw new TypeError('Illegal constructor');
+  }
+  // Mirrors the browser: form.submit() builds the entry list and fires `formdata`, no `submit` event.
+  const nativeFormSubmit = function submit() {
+    if (!this || this.nodeName !== 'FORM') throw new TypeError('Illegal invocation');
+    const data = makeFormData(collectEntries(this));
+    dispatch('formdata', this, { formData: data });
+    nativeSubmissions.push({ form: this, data });
+  };
+  HTMLFormElement.prototype.submit = nativeFormSubmit;
   Object.defineProperty(document, 'cookie', {
     get() {
       return cookieStr;
@@ -325,6 +361,7 @@ function createEnv(opts) {
     },
     indexedDB: { open: idb.open.bind(idb) },
     FormData: opts.noFormData ? undefined : FakeFormData,
+    HTMLFormElement: opts.noHTMLFormElement ? undefined : HTMLFormElement,
     MutationObserver: function (fn) {
       this.observe = function () {};
     },
@@ -342,8 +379,8 @@ function createEnv(opts) {
     JSON,
     Date,
     Math,
-    addEventListener(type, fn) {
-      (listeners[type] = listeners[type] || []).push(fn);
+    addEventListener(type, fn, options) {
+      listen('window', type, fn, options);
     },
     fetch(url, init) {
       fetches.push({ url, body: init && init.body, keepalive: !!(init && init.keepalive) });
@@ -423,11 +460,12 @@ function createEnv(opts) {
     if (submitter != null && submitter.nodeName !== 'BUTTON' && submitter.nodeName !== 'INPUT') {
       throw new TypeError("Failed to construct 'FormData': The specified element is not a submit button.");
     }
-    const data = makeFormData(form && form._entries);
+    const data = makeFormData(form ? ((form._entries || []).concat(collectEntries(form))) : []);
     Object.assign(this, data);
     if (form) dispatch('formdata', form, { formData: this });
   }
 
+  // Capture on window, capture on document, target, bubble on document, bubble on window.
   function dispatch(type, target, extra) {
     const event = Object.assign(
       {
@@ -442,10 +480,28 @@ function createEnv(opts) {
         shiftKey: false,
         altKey: false,
         metaKey: false,
+        defaultPrevented: false,
+        preventDefault() {
+          this.defaultPrevented = true;
+        },
+        stopPropagation() {
+          this._stopped = true;
+        },
       },
       extra || {}
     );
-    (listeners[type] || []).forEach((fn) => fn(event));
+    const all = (listeners[type] || []).slice();
+    const phase = (owner, capture) =>
+      all.filter((fn) => {
+        const meta = listenerPhase.get(fn) || { owner: 'document', capture: true };
+        return meta.owner === owner && meta.capture === capture;
+      });
+    const own = event.target && event.target !== document && event.target._listeners ? (event.target._listeners[type] || []).slice() : [];
+    const groups = [phase('window', true), phase('document', true), own, phase('document', false), phase('window', false)];
+    for (const group of groups) {
+      for (const fn of group) fn(event);
+      if (event._stopped) break;
+    }
     return event;
   }
 
@@ -495,6 +551,9 @@ function createEnv(opts) {
       vm.runInContext(SOURCE, sandbox);
     },
     FakeFormData,
+    HTMLFormElement,
+    nativeSubmissions,
+    nativeSubmit: nativeFormSubmit,
     setFetch(fn) {
       fetchImpl = fn;
     },
@@ -534,17 +593,50 @@ function makeFormData(entries) {
   };
 }
 
-function submitForm(env, form, submitter, entries) {
-  const data = makeFormData(entries);
-  env.dispatch('submit', form, { submitter: submitter || null });
+// The browser builds the entry list from the form's enabled named controls.
+function collectEntries(form) {
+  return (form.elements || [])
+    .filter((el) => el && el.name && !el.disabled && el.nodeName !== 'BUTTON' && el.type !== 'submit' && el.type !== 'button')
+    .map((el) => [el.name, el.value]);
+}
+
+// `entries` are the page's own controls: present in the form for the duration of the submission.
+function withControls(form, entries, fn) {
+  if (!form.elements) form.elements = [];
+  const added = (entries || []).map((pair) => ({ nodeName: 'INPUT', type: 'text', name: pair[0], value: pair[1], disabled: false }));
+  added.forEach((control) => form.elements.push(control));
+  try {
+    return fn();
+  } finally {
+    added.forEach((control) => {
+      const idx = form.elements.indexOf(control);
+      if (idx !== -1) form.elements.splice(idx, 1);
+    });
+  }
+}
+
+function nativeEntryList(env, form) {
+  const data = makeFormData(collectEntries(form));
   env.dispatch('formdata', form, { formData: data });
   return data;
 }
 
+// Native interactive submission: `submit` event, then (unless cancelled) entry list + `formdata`.
+function submitForm(env, form, submitter, entries) {
+  return withControls(form, entries, () => {
+    const event = env.dispatch('submit', form, { submitter: submitter || null });
+    if (event.defaultPrevented) return makeFormData([]);
+    return nativeEntryList(env, form);
+  });
+}
+
+// HTMLFormElement.prototype.submit.call(form): no `submit` event.
 function programmaticFormSubmit(env, form, entries) {
-  const data = makeFormData(entries);
-  env.dispatch('formdata', form, { formData: data });
-  return data;
+  return withControls(form, entries, () => {
+    const before = env.nativeSubmissions.length;
+    env.window.HTMLFormElement.prototype.submit.call(form);
+    return env.nativeSubmissions.length > before ? env.nativeSubmissions[env.nativeSubmissions.length - 1].data : makeFormData([]);
+  });
 }
 
 function ofType(env, type) {
@@ -592,6 +684,11 @@ async function run() {
       appendChild(child) {
         this.elements.push(child);
         this._inputs = this.elements;
+        child.parentNode = this;
+      },
+      removeChild(child) {
+        this.elements.splice(this.elements.indexOf(child), 1);
+        child.parentNode = null;
       },
       getElementsByTagName(tag) {
         return tag === 'input' ? this.elements : [];
@@ -3739,6 +3836,11 @@ async function run() {
       appendChild(child) {
         this.elements.push(child);
         this._inputs = this.elements;
+        child.parentNode = this;
+      },
+      removeChild(child) {
+        this.elements.splice(this.elements.indexOf(child), 1);
+        child.parentNode = null;
       },
       getElementsByTagName(tag) {
         return tag === 'input' ? this.elements : [];
@@ -4202,13 +4304,21 @@ async function run() {
     return button;
   }
 
+  // Real user input: the browser runs a microtask checkpoint between `submit` and the entry list.
   async function userSubmit(env, form, submitter, entries) {
-    const data = makeFormData(entries);
-    const event = env.dispatch('submit', form, { submitter: submitter || null, defaultPrevented: false });
+    if (!form.elements) form.elements = [];
+    const added = (entries || []).map((pair) => ({ nodeName: 'INPUT', type: 'text', name: pair[0], value: pair[1] }));
+    added.forEach((control) => form.elements.push(control));
+    const event = env.dispatch('submit', form, { submitter: submitter || null });
     await Promise.resolve();
     await Promise.resolve();
-    env.dispatch('formdata', form, { formData: data });
+    const data = event.defaultPrevented ? makeFormData([]) : nativeEntryList(env, form);
+    added.forEach((control) => form.elements.splice(form.elements.indexOf(control), 1));
     return { data, event };
+  }
+
+  function sdkFieldCount(form) {
+    return (form.elements || []).filter((el) => el.name === 'rqcid' && el.type === 'hidden').length;
   }
 
   await test('F11 programmatic FormData of a same-origin form gets no SDK rqcid', async () => {
@@ -4238,11 +4348,13 @@ async function run() {
     let cancelled = null;
     env.document.addEventListener('submit', (event) => {
       if (event.target !== prevented) return;
-      event.defaultPrevented = true;
+      event.preventDefault();
       cancelled = new env.window.FormData(prevented);
     });
-    env.dispatch('submit', prevented, { submitter: null, defaultPrevented: false });
+    env.dispatch('submit', prevented, { submitter: null });
     assert.strictEqual(cancelled.count('rqcid'), 0);
+    assert.strictEqual(sdkFieldCount(prevented), 0);
+    assert.strictEqual(sdkFieldCount(form), 0);
   });
 
   await test('nested, repeated and subclassed FormData construction stay clean', async () => {
@@ -4283,7 +4395,7 @@ async function run() {
     assert.strictEqual(nativeData.get('rqcid'), 'abcdefghijkl');
   });
 
-  await test('FormData constructor errors clear the programmatic context', async () => {
+  await test('FormData constructor errors do not affect native submission', async () => {
     const env = await load();
     const form = actionForm(env, '/order', 'post');
     assert.throws(() => new env.window.FormData({}), TypeError);
@@ -4317,52 +4429,914 @@ async function run() {
     assert.strictEqual((await userSubmit(env, getForm, submitButton(env, 'https://external.example/s'))).data.count('rqcid'), 0);
   });
 
+  function cancelOnce(form) {
+    form.addEventListener('submit', function cancel(event) {
+      form._listeners.submit.splice(form._listeners.submit.indexOf(cancel), 1);
+      event.preventDefault();
+    });
+  }
+
   await test('cancelled submit does not leave its submitter for a later form.submit()', async () => {
     const env = await load();
     const external = actionForm(env, 'https://external.example/order', 'post');
-    const event = env.dispatch('submit', external, { submitter: submitButton(env, '/local-order'), defaultPrevented: false });
-    event.defaultPrevented = true;
-    await Promise.resolve();
+    cancelOnce(external);
+    await userSubmit(env, external, submitButton(env, '/local-order'));
+    assert.strictEqual(sdkFieldCount(external), 0);
     assert.strictEqual(programmaticFormSubmit(env, external).count('rqcid'), 0);
     const local = actionForm(env, '/order', 'post');
-    const again = env.dispatch('submit', local, { submitter: submitButton(env, 'https://external.example/order'), defaultPrevented: false });
-    again.defaultPrevented = true;
+    cancelOnce(local);
+    await userSubmit(env, local, submitButton(env, 'https://external.example/order'));
     assert.strictEqual(programmaticFormSubmit(env, local).get('rqcid'), 'abcdefghijkl');
     const used = actionForm(env, 'https://external.example/order', 'post');
     await userSubmit(env, used, submitButton(env, '/local-order'));
     assert.strictEqual(programmaticFormSubmit(env, used).count('rqcid'), 0);
   });
 
-  await test('FormData guard is installed once and keeps native behaviour on re-run', async () => {
+  await test('SDK leaves window.FormData untouched; a saved original constructor gets no rqcid', async () => {
     const env = await load();
-    const wrapped = env.window.FormData;
-    assert.strictEqual(typeof wrapped, 'function');
-    assert.notStrictEqual(wrapped, env.FakeFormData);
-    assert.strictEqual(wrapped.prototype, env.FakeFormData.prototype);
-    assert.ok(new wrapped() instanceof env.FakeFormData);
-    env.rerun();
-    env.window.RefIQ.init({ siteKey: 'site_test' });
-    assert.strictEqual(env.window.FormData, wrapped);
-    const form = actionForm(env, '/order', 'post');
-    assert.strictEqual(submitForm(env, form).count('rqcid'), 1);
-    assert.strictEqual(new env.window.FormData(form).count('rqcid'), 0);
-    assert.strictEqual(env.window.RefIQ._diagnostics.formDataGuard, 'installed');
+    const Original = env.window.FormData;
+    assert.strictEqual(Original, env.FakeFormData);
+    const same = actionForm(env, '/order', 'post');
+    const external = actionForm(env, 'https://external.example/order', 'post');
+    assert.strictEqual(new Original(same).count('rqcid'), 0);
+    assert.strictEqual(new Original(external).count('rqcid'), 0);
+    assert.strictEqual(new Original(same, submitButton(env, '/order')).count('rqcid'), 0);
+    for (const opts of [{ noProxy: true }, { noFormData: true }]) {
+      const other = await load(opts);
+      assert.strictEqual(submitForm(other, actionForm(other, '/order')).get('rqcid'), 'abcdefghijkl', JSON.stringify(opts));
+    }
+    assert.ok(!('formDataGuard' in env.window.RefIQ._diagnostics));
   });
 
-  await test('without a FormData guard the SDK does not inject rqcid', async () => {
-    for (const opts of [{ noProxy: true }, { noFormData: true }]) {
-      const env = await load(opts);
-      const form = actionForm(env, '/order', 'post');
-      assert.strictEqual(submitForm(env, form).count('rqcid'), 0, JSON.stringify(opts));
-      assert.strictEqual(env.window.RefIQ.getRqcid(), 'abcdefghijkl');
-      assert.strictEqual(env.window.RefIQ._diagnostics.formDataGuard, 'unsupported');
-      await env.drain();
-      assert.ok(ofType(env, 'form_submit').length >= 1);
+  await test('programmatic FormData stays clean at every point around a submission', async () => {
+    const env = await load();
+    const form = actionForm(env, '/order', 'post');
+    const seen = {};
+    seen.before = new env.window.FormData(form).count('rqcid');
+    form.addEventListener('submit', () => {
+      seen.formListener = new env.window.FormData(form).count('rqcid');
+    });
+    env.document.addEventListener('submit', () => {
+      seen.documentListener = new env.window.FormData(form).count('rqcid');
+    });
+    env.document.addEventListener('submit', () => {
+      seen.documentCapture = new env.window.FormData(form).count('rqcid');
+    }, true);
+    const other = actionForm(env, '/order', 'post');
+    env.document.addEventListener('formdata', (event) => {
+      if (event.target === form && seen.nested == null) seen.nested = new env.window.FormData(other).count('rqcid');
+    });
+    const native = submitForm(env, form, null, [['productId', '1']]);
+    seen.after = new env.window.FormData(form).count('rqcid');
+    assert.deepStrictEqual(seen, { before: 0, documentCapture: 0, formListener: 0, documentListener: 0, nested: 0, after: 0 });
+    assert.strictEqual(native.get('rqcid'), 'abcdefghijkl');
+    assert.strictEqual(sdkFieldCount(form), 0);
+  });
+
+  await test('preventDefault then cross-origin AJAX copy carries no rqcid and leaves no field', async () => {
+    const env = await load();
+    const form = actionForm(env, '/order', 'post');
+    let ajax = null;
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      ajax = new env.window.FormData(form);
+    });
+    const { data } = await userSubmit(env, form, submitButton(env), [['productId', '1']]);
+    assert.strictEqual(ajax.count('rqcid'), 0);
+    assert.strictEqual(data.count('rqcid'), 0);
+    assert.strictEqual(sdkFieldCount(form), 0);
+    await env.drain();
+    assert.strictEqual(sdkFieldCount(form), 0);
+    assert.ok(ofType(env, 'form_submit').length >= 1);
+  });
+
+  await test('action and formaction changed by page submit handlers are honoured', async () => {
+    const env = await load();
+    const form = actionForm(env, '/order', 'post');
+    form.addEventListener('submit', () => form.setAttribute('action', 'https://external.example/order'));
+    assert.strictEqual(submitForm(env, form).count('rqcid'), 0);
+    const back = actionForm(env, 'https://external.example/order', 'post');
+    back.addEventListener('submit', () => back.setAttribute('action', '/order'));
+    assert.strictEqual(submitForm(env, back).get('rqcid'), 'abcdefghijkl');
+    const button = submitButton(env, '/local');
+    const viaButton = actionForm(env, '/order', 'post');
+    viaButton.addEventListener('submit', () => button.setAttribute('formaction', 'https://external.example/x'));
+    assert.strictEqual(submitForm(env, viaButton, button).count('rqcid'), 0);
+  });
+
+  await test('SDK field lifecycle: removed at formdata, by timer if no formdata, never duplicated', async () => {
+    const env = await load();
+    const form = actionForm(env, '/order', 'post');
+    env.dispatch('submit', form, { submitter: null });
+    assert.strictEqual(sdkFieldCount(form), 1);
+    env.dispatch('submit', form, { submitter: null });
+    assert.strictEqual(sdkFieldCount(form), 1);
+    await env.drain();
+    assert.strictEqual(sdkFieldCount(form), 0);
+    for (let i = 0; i < 3; i += 1) {
+      assert.strictEqual(submitForm(env, form).count('rqcid'), 1);
+      assert.strictEqual(programmaticFormSubmit(env, form).count('rqcid'), 1);
     }
-    const replaced = await load();
-    replaced.window.FormData = function OtherFormData() {};
-    assert.strictEqual(submitForm(replaced, actionForm(replaced, '/order')).count('rqcid'), 0);
-    assert.strictEqual(replaced.window.RefIQ._diagnostics.formDataGuard, 'replaced');
+    assert.strictEqual(form.elements.length, 0);
+    const stopped = actionForm(env, '/order', 'post');
+    stopped.addEventListener('submit', (event) => event.stopPropagation());
+    assert.strictEqual(submitForm(env, stopped).count('rqcid'), 0);
+    const dialog = actionForm(env, '/order', 'dialog');
+    dialog.setAttribute('method', 'dialog');
+    assert.strictEqual(submitForm(env, dialog).count('rqcid'), 0);
+    const loose = actionForm(env, '/order', 'post');
+    loose.checkValidity = () => false;
+    loose.setAttribute('novalidate', '');
+    assert.strictEqual(submitForm(env, loose).get('rqcid'), 'abcdefghijkl');
+    const disabled = actionForm(env, '/order', 'post');
+    disabled.elements.push({ nodeName: 'INPUT', type: 'text', name: 'rqcid', value: 'off', disabled: true });
+    assert.strictEqual(submitForm(env, disabled).get('rqcid'), 'abcdefghijkl');
+  });
+
+  await test('form.submit() wrapper keeps native semantics and is installed once', async () => {
+    const env = await load();
+    const proto = env.window.HTMLFormElement.prototype;
+    const wrapped = proto.submit;
+    assert.notStrictEqual(wrapped, env.nativeSubmit);
+    assert.strictEqual(wrapped.__refiqNativeSubmit, env.nativeSubmit);
+    assert.strictEqual(wrapped.name, 'submit');
+    assert.strictEqual(wrapped.length, 0);
+    assert.throws(() => wrapped.call({}), TypeError);
+    assert.throws(() => wrapped.call(null), TypeError);
+    const form = actionForm(env, '/order', 'post');
+    assert.strictEqual(form.submit(), undefined);
+    assert.strictEqual(env.nativeSubmissions.slice(-1)[0].data.get('rqcid'), 'abcdefghijkl');
+    wrapped.apply(form, []);
+    assert.strictEqual(env.nativeSubmissions.slice(-1)[0].data.count('rqcid'), 1);
+    assert.strictEqual(sdkFieldCount(form), 0);
+    const failing = actionForm(env, '/order', 'post');
+    // Throws inside the native submit before the SDK `formdata` cleanup runs.
+    env.window.addEventListener('formdata', (event) => {
+      if (event.target === failing) throw new Error('native failure');
+    }, true);
+    assert.throws(() => failing.submit(), /native failure/);
+    assert.strictEqual(sdkFieldCount(failing), 0);
+    env.rerun();
+    assert.strictEqual(proto.submit, wrapped);
+    delete env.window.RefIQ;
+    env.rerun();
+    assert.strictEqual(proto.submit, wrapped);
+    const twice = actionForm(env, '/order', 'post');
+    assert.strictEqual(submitForm(env, twice).count('rqcid'), 1);
+    assert.strictEqual(programmaticFormSubmit(env, twice).count('rqcid'), 1);
+    assert.strictEqual(sdkFieldCount(twice), 0);
+    const bare = await load({ noHTMLFormElement: true });
+    assert.strictEqual(submitForm(bare, actionForm(bare, '/order')).get('rqcid'), 'abcdefghijkl');
+  });
+
+  function trackEl(env, tag) {
+    const node = env.document.createElement(tag);
+    node.nodeType = 1;
+    const append = node.appendChild.bind(node);
+    node.appendChild = function (child) {
+      const prev = this.lastElementChild || null;
+      append(child);
+      if (!child.nodeType) child.nodeType = 1;
+      child.parentElement = this;
+      child.previousElementSibling = prev;
+      if (prev) prev.nextElementSibling = child;
+      this.lastElementChild = child;
+      return child;
+    };
+    return node;
+  }
+
+  function identityOf(target) {
+    const out = {};
+    ['elementKey', 'elementType', 'actionType', 'semanticRole', 'identitySource', 'formId'].forEach((key) => {
+      if (target && Object.prototype.hasOwnProperty.call(target, key)) out[key] = target[key];
+    });
+    return out;
+  }
+
+  async function dispatchedClick(env, node, extra) {
+    env.fetches.length = 0;
+    env.dispatch('click', node, extra);
+    await env.drain();
+    const clicks = ofType(env, 'click');
+    assert.ok(clicks.length >= 1);
+    return clicks[clicks.length - 1];
+  }
+
+  await test('T01 simple button', async () => {
+    const env = await load();
+    const button = trackEl(env, 'button');
+    button.id = 'buy-button';
+    const click = await dispatchedClick(env, button);
+    assert.strictEqual(click.payload.target.tag, 'BUTTON');
+    assert.strictEqual(click.payload.target.id, 'buy-button');
+    assert.deepStrictEqual(identityOf(click.payload.target), {
+      elementKey: 'buy-button',
+      elementType: 'button',
+      actionType: 'custom',
+      identitySource: 'id',
+    });
+  });
+
+  await test('T02 nested span keeps the button key and the original tag', async () => {
+    const env = await load();
+    const button = trackEl(env, 'button');
+    button.id = 'submit-order';
+    button.setAttribute('data-refiq-id', 'checkout-buy');
+    const span = trackEl(env, 'span');
+    span.id = 'inner-label';
+    span.getBoundingClientRect = () => ({ left: 0, top: 4, width: 12, height: 8 });
+    button.appendChild(span);
+    const onButton = await dispatchedClick(env, button);
+    const onSpan = await dispatchedClick(env, span);
+    assert.strictEqual(onSpan.payload.target.elementKey, onButton.payload.target.elementKey);
+    assert.strictEqual(onSpan.payload.target.elementKey, 'checkout-buy');
+    assert.strictEqual(onSpan.payload.target.tag, 'SPAN');
+    assert.strictEqual(onSpan.payload.target.id, 'inner-label');
+    assert.strictEqual(onSpan.payload.target.trackingId, undefined);
+    assert.strictEqual(onSpan.payload.target.elementType, 'button');
+    assert.strictEqual(onSpan.payload.relativeX, 15);
+    assert.strictEqual(onSpan.payload.relativeY, 21);
+    assert.strictEqual(onSpan.payload.target.width, 12);
+    assert.strictEqual(onSpan.payload.target.height, 8);
+  });
+
+  await test('T03 svg path resolves to the same button', async () => {
+    const env = await load();
+    const button = trackEl(env, 'button');
+    button.setAttribute('data-refiq-id', 'checkout-buy');
+    const svg = trackEl(env, 'svg');
+    const path = trackEl(env, 'path');
+    path.tagName = 'path';
+    path.nodeName = 'path';
+    path.getBoundingClientRect = () => ({ left: 3, top: 4, width: 16, height: 16 });
+    svg.appendChild(path);
+    button.appendChild(svg);
+    const click = await dispatchedClick(env, path);
+    assert.strictEqual(click.payload.target.tag, 'path');
+    assert.strictEqual(click.payload.target.elementKey, 'checkout-buy');
+    assert.strictEqual(click.payload.target.elementType, 'button');
+    assert.strictEqual(click.payload.target.identitySource, 'data-refiq-id');
+    assert.strictEqual(click.payload.relativeX, 12);
+    assert.strictEqual(click.payload.relativeY, 21);
+  });
+
+  await test('T04 anchor and nested click stay links without changing href metadata', async () => {
+    const env = await load();
+    const anchor = trackEl(env, 'a');
+    anchor.id = 'product-link';
+    anchor.href = 'https://shop.example.com/product/a?token=sekret-token-zz';
+    const span = trackEl(env, 'span');
+    anchor.appendChild(span);
+    const direct = await dispatchedClick(env, anchor);
+    const nested = await dispatchedClick(env, span);
+    [direct, nested].forEach((click) => {
+      assert.strictEqual(click.payload.target.elementType, 'link');
+      assert.strictEqual(click.payload.target.actionType, 'navigate');
+      assert.strictEqual(click.payload.target.elementKey, 'product-link');
+      assert.strictEqual(click.payload.target.hrefPathname, '/product/a');
+      assert.strictEqual(click.payload.target.hrefPath, '/product/a');
+      assert.strictEqual(click.payload.target.hrefOrigin, 'https://shop.example.com');
+      assert.strictEqual(click.payload.target.hrefHostname, 'shop.example.com');
+      assert.strictEqual(click.payload.target.isExternal, false);
+      assert.strictEqual(click.payload.target.href, 'https://shop.example.com/product/a');
+      assert.ok(!JSON.stringify(identityOf(click.payload.target)).includes('sekret-token-zz'));
+    });
+    assert.strictEqual(direct.payload.target.tag, 'A');
+    assert.strictEqual(nested.payload.target.tag, 'SPAN');
+    assert.strictEqual(nested.payload.target.hrefPathname, direct.payload.target.hrefPathname);
+  });
+
+  await test('T05 data-refiq-id outranks a safe html id', async () => {
+    const env = await load();
+    const button = trackEl(env, 'button');
+    button.id = 'submit-order';
+    button.setAttribute('data-refiq-id', 'checkout-buy');
+    const click = await dispatchedClick(env, button);
+    assert.strictEqual(click.payload.target.elementKey, 'checkout-buy');
+    assert.strictEqual(click.payload.target.identitySource, 'data-refiq-id');
+    assert.strictEqual(click.payload.target.id, 'submit-order');
+    assert.strictEqual(click.payload.target.trackingId, 'checkout-buy');
+  });
+
+  await test('T06 safe html id is the second identity source', async () => {
+    const env = await load();
+    const button = trackEl(env, 'button');
+    button.id = 'submit-order';
+    const click = await dispatchedClick(env, button);
+    assert.strictEqual(click.payload.target.elementKey, 'submit-order');
+    assert.strictEqual(click.payload.target.identitySource, 'id');
+  });
+
+  await test('T07 dom path is stable, distinct, and not truncated into a collision', async () => {
+    const env = await load();
+    const body = trackEl(env, 'body');
+    const main = trackEl(env, 'main');
+    const first = trackEl(env, 'section');
+    const second = trackEl(env, 'section');
+    const button = trackEl(env, 'button');
+    const other = trackEl(env, 'button');
+    body.appendChild(main);
+    main.appendChild(first);
+    main.appendChild(second);
+    second.appendChild(button);
+    second.appendChild(other);
+    const expected = 'body>main:nth-of-type(1)>section:nth-of-type(2)>button:nth-of-type(1)';
+    const once = await dispatchedClick(env, button);
+    const twice = await dispatchedClick(env, button);
+    const neighbor = await dispatchedClick(env, other);
+    assert.strictEqual(once.payload.target.elementKey, expected);
+    assert.strictEqual(once.payload.target.identitySource, 'dom-path');
+    assert.strictEqual(twice.payload.target.elementKey, expected);
+    assert.notStrictEqual(neighbor.payload.target.elementKey, expected);
+    assert.ok(neighbor.payload.target.elementKey.indexOf('button:nth-of-type(2)') !== -1);
+    let deepA = trackEl(env, 'div');
+    let deepB = trackEl(env, 'div');
+    for (let i = 0; i < 16; i += 1) {
+      const nextA = trackEl(env, 'div');
+      const nextB = trackEl(env, 'div');
+      deepA.appendChild(nextA);
+      deepB.appendChild(nextB);
+      deepA = nextA;
+      deepB = nextB;
+    }
+    const leafA = trackEl(env, 'button');
+    const leafB = trackEl(env, 'button');
+    deepA.appendChild(leafA);
+    deepB.appendChild(leafB);
+    const buriedA = await dispatchedClick(env, leafA);
+    const buriedB = await dispatchedClick(env, leafB);
+    assert.strictEqual(buriedA.payload.target.elementKey, undefined);
+    assert.strictEqual(buriedB.payload.target.elementKey, undefined);
+    assert.strictEqual(buriedA.payload.target.elementType, 'button');
+  });
+
+  await test('T08 element type without reading text', async () => {
+    const env = await load();
+    async function kind(node) {
+      node.textContent = 'Купить user@example.com';
+      node.innerText = 'Купить user@example.com';
+      const click = await dispatchedClick(env, node);
+      assert.ok(!JSON.stringify(identityOf(click.payload.target)).includes('Купить'));
+      assert.ok(!JSON.stringify(identityOf(click.payload.target)).includes('user@example.com'));
+      return click.payload.target.elementType;
+    }
+    assert.strictEqual(await kind(trackEl(env, 'button')), 'button');
+    const link = trackEl(env, 'a');
+    link.href = 'https://shop.example.com/catalog';
+    assert.strictEqual(await kind(link), 'link');
+    const input = trackEl(env, 'input');
+    input.setAttribute('type', 'text');
+    assert.strictEqual(await kind(input), 'input');
+    assert.strictEqual(await kind(trackEl(env, 'select')), 'select');
+    assert.strictEqual(await kind(trackEl(env, 'textarea')), 'textarea');
+    const roleButton = trackEl(env, 'div');
+    roleButton.setAttribute('role', 'button');
+    assert.strictEqual(await kind(roleButton), 'button');
+    const widget = trackEl(env, 'my-widget');
+    widget.setAttribute('data-refiq-id', 'hero-card');
+    assert.strictEqual(await kind(widget), 'custom');
+    const tab = trackEl(env, 'div');
+    tab.setAttribute('role', 'tab');
+    assert.strictEqual(await kind(tab), 'custom');
+    const plain = trackEl(env, 'div');
+    plain.className = 'btn primary';
+    const plainClick = await dispatchedClick(env, plain);
+    assert.strictEqual(plainClick.payload.target.elementType, undefined);
+    assert.strictEqual(plainClick.payload.target.elementKey, undefined);
+  });
+
+  await test('T09 action type is the expected action, not a completed submit', async () => {
+    const env = await load();
+    async function action(node) {
+      return (await dispatchedClick(env, node)).payload.target.actionType;
+    }
+    const submit = trackEl(env, 'button');
+    submit.setAttribute('type', 'submit');
+    assert.strictEqual(await action(submit), 'submit');
+    const plain = trackEl(env, 'button');
+    plain.setAttribute('type', 'button');
+    assert.strictEqual(await action(plain), 'custom');
+    const outside = trackEl(env, 'button');
+    assert.strictEqual(await action(outside), 'custom');
+    const form = trackEl(env, 'form');
+    form.id = 'checkout-form';
+    const implicit = trackEl(env, 'button');
+    form.appendChild(implicit);
+    assert.strictEqual(await action(implicit), 'submit');
+    const reset = trackEl(env, 'button');
+    reset.setAttribute('type', 'reset');
+    form.appendChild(reset);
+    assert.strictEqual(await action(reset), undefined);
+    const anchor = trackEl(env, 'a');
+    anchor.href = 'https://shop.example.com/next';
+    assert.strictEqual(await action(anchor), 'navigate');
+    const checkbox = trackEl(env, 'input');
+    checkbox.setAttribute('type', 'checkbox');
+    assert.strictEqual(await action(checkbox), 'toggle');
+    const radio = trackEl(env, 'input');
+    radio.setAttribute('type', 'radio');
+    assert.strictEqual(await action(radio), 'toggle');
+    const switched = trackEl(env, 'div');
+    switched.setAttribute('role', 'switch');
+    assert.strictEqual(await action(switched), 'toggle');
+    const summary = trackEl(env, 'summary');
+    assert.strictEqual(await action(summary), 'toggle');
+    assert.strictEqual(sdkFieldCount(form), 0);
+    assert.strictEqual(ofType(env, 'form_submit').length, 0);
+  });
+
+  await test('T10 semantic role allowlist', async () => {
+    const env = await load();
+    async function role(value) {
+      const button = trackEl(env, 'button');
+      if (value != null) button.setAttribute('data-refiq-role', value);
+      return (await dispatchedClick(env, button)).payload.target.semanticRole;
+    }
+    assert.strictEqual(await role('cta'), 'cta');
+    assert.strictEqual(await role('navigation'), 'navigation');
+    assert.strictEqual(await role('search'), 'search');
+    assert.strictEqual(await role('checkout'), 'checkout');
+    assert.strictEqual(await role('primary'), undefined);
+    assert.strictEqual(await role('CTA'), undefined);
+    assert.strictEqual(await role('constructor'), undefined);
+    assert.strictEqual(await role('buy now'), undefined);
+    const search = trackEl(env, 'input');
+    search.setAttribute('type', 'search');
+    search.placeholder = 'user@example.com';
+    const searchClick = await dispatchedClick(env, search);
+    assert.strictEqual(searchClick.payload.target.semanticRole, undefined);
+    assert.strictEqual(searchClick.payload.target.elementType, 'input');
+  });
+
+  await test('T11 form id without mutating the form', async () => {
+    const env = await load();
+    const form = trackEl(env, 'form');
+    form.id = 'checkout-form';
+    const button = trackEl(env, 'button');
+    button.setAttribute('type', 'submit');
+    form.appendChild(button);
+    const before = (form.elements || []).map((el) => el.name);
+    const inside = await dispatchedClick(env, button);
+    assert.strictEqual(inside.payload.target.formId, 'checkout-form');
+    assert.strictEqual(inside.payload.target.actionType, 'submit');
+    assert.deepStrictEqual((form.elements || []).map((el) => el.name), before);
+    assert.strictEqual(sdkFieldCount(form), 0);
+
+    const marked = trackEl(env, 'form');
+    marked.id = 'html-form';
+    marked.setAttribute('data-refiq-id', 'checkout-form-ref');
+    const markedButton = trackEl(env, 'button');
+    markedButton.setAttribute('type', 'submit');
+    marked.appendChild(markedButton);
+    const markedClick = await dispatchedClick(env, markedButton);
+    assert.strictEqual(markedClick.payload.target.formId, 'checkout-form-ref');
+
+    const bare = trackEl(env, 'form');
+    const bareButton = trackEl(env, 'button');
+    bareButton.setAttribute('type', 'submit');
+    bare.appendChild(bareButton);
+    const bareClick = await dispatchedClick(env, bareButton);
+    assert.strictEqual(bareClick.payload.target.formId, undefined);
+    assert.strictEqual(bareClick.payload.target.actionType, 'submit');
+
+    const external = trackEl(env, 'form');
+    external.id = 'external-form';
+    const outside = trackEl(env, 'button');
+    outside.setAttribute('type', 'submit');
+    outside.form = external;
+    const owned = await dispatchedClick(env, outside);
+    assert.strictEqual(owned.payload.target.formId, 'external-form');
+
+    const byAttr = trackEl(env, 'button');
+    byAttr.setAttribute('type', 'submit');
+    byAttr.setAttribute('form', 'external-form');
+    env.document.getElementById = (id) => (id === 'external-form' ? external : null);
+    const linked = await dispatchedClick(env, byAttr);
+    assert.strictEqual(linked.payload.target.formId, 'external-form');
+    assert.strictEqual(sdkFieldCount(external), 0);
+
+    const unsafe = trackEl(env, 'form');
+    unsafe.id = 'user@example.com';
+    const unsafeButton = trackEl(env, 'button');
+    unsafeButton.setAttribute('type', 'submit');
+    unsafe.appendChild(unsafeButton);
+    const unsafeClick = await dispatchedClick(env, unsafeButton);
+    assert.strictEqual(unsafeClick.payload.target.formId, undefined);
+    assert.ok(!JSON.stringify(identityOf(unsafeClick.payload.target)).includes('user@example.com'));
+  });
+
+  await test('T12 button added after load uses the existing click listener', async () => {
+    const env = await load();
+    const before = env.listeners.click.length;
+    const button = trackEl(env, 'button');
+    button.setAttribute('data-refiq-id', 'late-button');
+    const click = await dispatchedClick(env, button);
+    assert.strictEqual(env.listeners.click.length, before);
+    assert.strictEqual(before, 1);
+    assert.strictEqual(click.payload.target.elementKey, 'late-button');
+    assert.strictEqual(click.payload.target.identitySource, 'data-refiq-id');
+  });
+
+  await test('T13 open shadow path and closed shadow stay inside exposed data', async () => {
+    const env = await load();
+    const body = trackEl(env, 'body');
+    const host = trackEl(env, 'div');
+    body.appendChild(host);
+    const root = { nodeType: 11, nodeName: '#document-fragment', host };
+    const button = trackEl(env, 'button');
+    button.id = 'shadow-btn';
+    button.parentNode = root;
+    const inner = trackEl(env, 'span');
+    inner.parentNode = button;
+    inner.parentElement = button;
+    let peeked = 0;
+    Object.defineProperty(host, 'contentDocument', { get() { peeked += 1; throw new Error('cross-origin'); } });
+    const open = await dispatchedClick(env, inner, {
+      composedPath() {
+        return [inner, button, root, host, env.document];
+      },
+    });
+    assert.strictEqual(open.payload.target.tag, 'SPAN');
+    assert.strictEqual(open.payload.target.elementKey, 'shadow-btn');
+    assert.strictEqual(open.payload.target.elementType, 'button');
+    assert.strictEqual(open.payload.target.identitySource, 'id');
+    const closedHost = trackEl(env, 'div');
+    Object.defineProperty(closedHost, 'contentDocument', { get() { peeked += 1; throw new Error('closed'); } });
+    const closed = await dispatchedClick(env, closedHost, {
+      composedPath() {
+        return [closedHost, env.document];
+      },
+    });
+    assert.strictEqual(closed.payload.target.tag, 'DIV');
+    assert.strictEqual(closed.payload.target.elementKey, undefined);
+    assert.strictEqual(closed.payload.target.elementType, undefined);
+    assert.strictEqual(peeked, 0);
+    const frame = trackEl(env, 'iframe');
+    Object.defineProperty(frame, 'contentDocument', { get() { peeked += 1; throw new Error('frame'); } });
+    Object.defineProperty(frame, 'contentWindow', { get() { peeked += 1; throw new Error('frame'); } });
+    const framed = await dispatchedClick(env, frame);
+    assert.strictEqual(framed.payload.target.elementKey, undefined);
+    assert.strictEqual(peeked, 0);
+  });
+
+  await test('T14 three clicks stay three click events with one element key', async () => {
+    const env = await load();
+    const button = trackEl(env, 'button');
+    button.setAttribute('data-refiq-id', 'checkout-buy');
+    env.fetches.length = 0;
+    env.dispatch('click', button);
+    env.dispatch('click', button);
+    env.dispatch('click', button);
+    await env.drain();
+    const clicks = ofType(env, 'click');
+    assert.strictEqual(clicks.length, 3);
+    const ids = clicks.map((event) => event.clientEventId);
+    assert.strictEqual(new Set(ids).size, 3);
+    assert.ok(clicks[0].sequence < clicks[1].sequence);
+    assert.ok(clicks[1].sequence < clicks[2].sequence);
+    clicks.forEach((event, index) => {
+      assert.strictEqual(event.type, 'click');
+      assert.strictEqual(event.payload.target.elementKey, 'checkout-buy');
+      assert.strictEqual(typeof event.occurredAtMs, 'number');
+      if (index > 0) assert.ok(event.occurredAtMs >= clicks[index - 1].occurredAtMs);
+      assert.strictEqual(event.payload.rageClick, undefined);
+      assert.strictEqual(event.payload.target.rageClick, undefined);
+    });
+    assert.ok(!eventsFrom(env).some((event) => event.type === 'rage_click' || event.type === 'rageClick'));
+  });
+
+  await test('T15 unsafe identifiers and extra attributes are not copied', async () => {
+    const env = await load();
+    const secrets = [
+      'user@example.com',
+      '+79991234567',
+      'tel-79991234567',
+      'https://shop.example/reset?token=sekret-token-zz',
+      'a'.repeat(80),
+      'order-1712345678901',
+      '550e8400-e29b-41d4-a716-446655440000',
+      'abcdef0123456789',
+    ];
+    for (const secret of secrets) {
+      const button = trackEl(env, 'button');
+      button.setAttribute('data-refiq-id', secret);
+      button.id = 'safe-button';
+      button.className = secret;
+      button.setAttribute('data-user', secret);
+      button.value = secret;
+      button.textContent = secret;
+      const click = await dispatchedClick(env, button);
+      const encoded = JSON.stringify(identityOf(click.payload.target));
+      assert.ok(!encoded.includes(secret), secret);
+      assert.strictEqual(click.payload.target.elementKey, 'safe-button');
+      assert.strictEqual(click.payload.target.identitySource, 'id');
+    }
+    const both = trackEl(env, 'button');
+    both.setAttribute('data-refiq-id', 'user@example.com');
+    both.id = 'order-1712345678901';
+    const structural = await dispatchedClick(env, both);
+    assert.strictEqual(structural.payload.target.identitySource, 'dom-path');
+    assert.ok(!JSON.stringify(identityOf(structural.payload.target)).includes('user@example.com'));
+    assert.ok(!JSON.stringify(identityOf(structural.payload.target)).includes('1712345678901'));
+    let parent = trackEl(env, 'div');
+    parent.id = 'user@example.com';
+    for (let i = 0; i < 20; i += 1) {
+      const next = trackEl(env, 'div');
+      next.setAttribute('data-token', 'sekret-token-zz');
+      parent.appendChild(next);
+      parent = next;
+    }
+    const buried = trackEl(env, 'button');
+    buried.setAttribute('data-refiq-id', 'user@example.com');
+    buried.id = '+79991234567';
+    parent.appendChild(buried);
+    const buriedClick = await dispatchedClick(env, buried);
+    const buriedFields = JSON.stringify(identityOf(buriedClick.payload.target));
+    assert.strictEqual(buriedClick.payload.target.elementKey, undefined);
+    assert.strictEqual(buriedClick.payload.target.elementType, 'button');
+    assert.ok(!buriedFields.includes('user@example.com'));
+    assert.ok(!buriedFields.includes('sekret-token-zz'));
+    assert.ok(!buriedFields.includes('+79991234567'));
+  });
+
+  await test('T16 previous click fields keep their meaning', async () => {
+    const env = await load();
+    const button = trackEl(env, 'button');
+    button.id = 'submit-order';
+    button.setAttribute('data-refiq-id', 'checkout-buy');
+    button.setAttribute('role', 'button');
+    button.setAttribute('data-refiq-role', 'cta');
+    button.setAttribute('type', 'submit');
+    const form = trackEl(env, 'form');
+    form.id = 'checkout-form';
+    const span = trackEl(env, 'span');
+    span.id = 'buy-button';
+    span.getBoundingClientRect = () => ({ left: 1, top: 2, width: 30, height: 14 });
+    button.appendChild(span);
+    form.appendChild(button);
+    const anchor = trackEl(env, 'a');
+    anchor.href = 'https://external.example/item?token=sekret-token-zz';
+    anchor.id = 'ext-link';
+    const click = await dispatchedClick(env, span);
+    const target = click.payload.target;
+    assert.strictEqual(click.payload.clientX, 15);
+    assert.strictEqual(click.payload.clientY, 25);
+    assert.strictEqual(click.payload.pageX, 15);
+    assert.strictEqual(click.payload.pageY, 25);
+    assert.strictEqual(click.payload.relativeX, 14);
+    assert.strictEqual(click.payload.relativeY, 23);
+    assert.strictEqual(click.payload.clickTargetX, 14);
+    assert.strictEqual(click.payload.clickTargetY, 23);
+    assert.strictEqual(target.trackingId, undefined);
+    assert.strictEqual(target.id, 'buy-button');
+    assert.strictEqual(target.tag, 'SPAN');
+    assert.strictEqual(target.role, undefined);
+    assert.strictEqual(target.width, 30);
+    assert.strictEqual(target.height, 14);
+    assert.strictEqual(target.href, undefined);
+    assert.deepStrictEqual(identityOf(target), {
+      elementKey: 'checkout-buy',
+      elementType: 'button',
+      actionType: 'submit',
+      semanticRole: 'cta',
+      identitySource: 'data-refiq-id',
+      formId: 'checkout-form',
+    });
+    assert.ok(!Object.prototype.hasOwnProperty.call(click.payload, 'elementKey'));
+    assert.ok(!Object.prototype.hasOwnProperty.call(click, 'elementKey'));
+    const allowed = {
+      trackingId: 1, id: 1, tag: 1, role: 1, width: 1, height: 1,
+      hrefPath: 1, hrefPathname: 1, hrefOrigin: 1, hrefHostname: 1, isExternal: 1, href: 1,
+      elementKey: 1, elementType: 1, actionType: 1, semanticRole: 1, identitySource: 1, formId: 1,
+    };
+    Object.keys(target).forEach((key) => assert.ok(allowed[key], key));
+    const external = await dispatchedClick(env, anchor);
+    assert.strictEqual(external.payload.target.tag, 'A');
+    assert.strictEqual(external.payload.target.id, 'ext-link');
+    assert.strictEqual(external.payload.target.hrefHostname, 'external.example');
+    assert.strictEqual(external.payload.target.href, 'https://external.example/item');
+    assert.strictEqual(external.payload.target.isExternal, true);
+    assert.strictEqual(external.payload.target.elementType, 'link');
+    assert.strictEqual(external.payload.target.actionType, 'navigate');
+    assert.ok(!external.payload.target.href.includes('sekret-token-zz'));
+  });
+
+  await test('T17 click identity does not change rqcid form submission', async () => {
+    const env = await load();
+    const form = actionForm(env, '/order', 'post');
+    form.id = 'checkout-form';
+    const button = trackEl(env, 'button');
+    button.setAttribute('type', 'submit');
+    button.setAttribute('data-refiq-id', 'checkout-buy');
+    button.setAttribute('data-refiq-role', 'cta');
+    form.appendChild(button);
+    env.fetches.length = 0;
+    env.dispatch('click', button);
+    assert.strictEqual(sdkFieldCount(form), 0);
+    const data = submitForm(env, form, button, [['productId', '1']]);
+    assert.strictEqual(data.get('productId'), '1');
+    assert.strictEqual(data.count('rqcid'), 1);
+    assert.strictEqual(data.get('rqcid'), 'abcdefghijkl');
+    assert.strictEqual(sdkFieldCount(form), 0);
+    await env.drain();
+    const click = ofType(env, 'click')[0];
+    assert.strictEqual(click.payload.target.elementKey, 'checkout-buy');
+    assert.strictEqual(click.payload.target.formId, 'checkout-form');
+    assert.strictEqual(click.payload.target.actionType, 'submit');
+    const submit = ofType(env, 'form_submit')[0];
+    assert.strictEqual(submit.payload.formId, 'checkout-form');
+    assert.strictEqual(submit.payload.elementKey, undefined);
+    assert.strictEqual(submit.payload.elementType, undefined);
+    assert.strictEqual(submit.payload.target, undefined);
+  });
+
+  await test('T18 click identity stays inside the existing batch envelope', async () => {
+    let failNext = false;
+    const env = await load({
+      fetchImpl: async () => {
+        if (failNext) {
+          failNext = false;
+          return { ok: false, status: 503, headers: { get() { return null; } } };
+        }
+        return { ok: true, status: 204, headers: { get() { return null; } } };
+      },
+    });
+    await env.drain();
+    const button = trackEl(env, 'button');
+    button.setAttribute('data-refiq-id', 'checkout-buy');
+    env.fetches.length = 0;
+    env.dispatch('click', button);
+    await Promise.resolve();
+    const stored = Array.from(env.idb.data.values()).map((row) => row.event).filter((event) => event && event.type === 'click');
+    assert.ok(stored.some((event) => event.payload.target.elementKey === 'checkout-buy'));
+    stored.forEach((event) => {
+      assert.ok(!Object.prototype.hasOwnProperty.call(event, 'elementKey'));
+      assert.strictEqual(event.schemaVersion, undefined);
+    });
+    failNext = true;
+    await env.drain();
+    const batches = env.fetches.map((item) => JSON.parse(item.body));
+    assert.ok(batches.length >= 2);
+    const clicks = [];
+    batches.forEach((batch) => {
+      assert.strictEqual(batch.schemaVersion, 1);
+      assert.strictEqual(batch.sdkVersion, '2.0.1');
+      assert.ok(!Object.prototype.hasOwnProperty.call(batch, 'target_element_key'));
+      assert.ok(batch.batchId);
+      assert.ok(JSON.stringify(batch).length < 24576 || batch.events.length <= 20);
+      (batch.events || []).forEach((event) => {
+        if (event.type === 'click') clicks.push({ event, batch });
+      });
+    });
+    assert.ok(clicks.length >= 2);
+    assert.strictEqual(clicks[0].event.clientEventId, clicks[1].event.clientEventId);
+    clicks.forEach((item) => {
+      assert.strictEqual(item.event.payload.target.elementKey, 'checkout-buy');
+      assert.ok(!Object.prototype.hasOwnProperty.call(item.event.payload, 'elementKey'));
+    });
+    env.fetches.length = 0;
+    env.dispatch('click', button);
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    assert.ok(env.beacons.length >= 1);
+    const beacon = JSON.parse(env.beacons[env.beacons.length - 1].body);
+    assert.strictEqual(beacon.schemaVersion, 1);
+    assert.ok(beacon.events.some((event) => event.type === 'click' && event.payload.target.elementKey === 'checkout-buy'));
+    assert.ok(env.beacons[env.beacons.length - 1].body.length <= 60000);
+  });
+
+  await test('T19 other event contracts do not gain element identity', async () => {
+    const env = await load();
+    await env.drain();
+    const page = ofType(env, 'page_view')[0];
+    assert.strictEqual(page.payload.elementKey, undefined);
+    assert.strictEqual(page.payload.target, undefined);
+    env.fetches.length = 0;
+    env.window.scrollY = 3200;
+    env.dispatch('scroll');
+    env.dispatch('error', null, { filename: 'https://shop.example.com/app.js?token=sekret-token-zz', lineno: 10, colno: 2 });
+    const form = actionForm(env, '/order', 'post');
+    submitForm(env, form, null, [['productId', '1']]);
+    env.document.visibilityState = 'hidden';
+    env.dispatch('visibilitychange');
+    await env.drain();
+    ['scroll', 'form_submit', 'page_engagement', 'js_error', 'page_view'].forEach((type) => {
+      ofType(env, type).forEach((event) => {
+        const raw = JSON.stringify(event.payload);
+        assert.ok(!raw.includes('elementKey'), type);
+        assert.ok(!raw.includes('elementType'), type);
+        assert.ok(!raw.includes('identitySource'), type);
+        assert.ok(!raw.includes('semanticRole'), type);
+        assert.ok(!raw.includes('actionType'), type);
+      });
+    });
+    const error = ofType(env, 'js_error')[0];
+    assert.ok(error);
+    assert.strictEqual(error.payload.errorType, 'error');
+    assert.ok(!JSON.stringify(error.payload).includes('sekret-token-zz'));
+    const submit = ofType(env, 'form_submit')[0];
+    assert.strictEqual(submit.payload.method, 'post');
+    assert.strictEqual(typeof submit.payload.fieldCount, 'number');
+  });
+
+  await test('T20 click identity stays bounded on deep and wide trees', async () => {
+    const env = await load();
+    let scans = 0;
+    env.document.querySelectorAll = () => {
+      scans += 1;
+      return [];
+    };
+    const shallow = trackEl(env, 'button');
+    shallow.id = 'shallow-button';
+    let parent = trackEl(env, 'div');
+    for (let i = 0; i < 30; i += 1) {
+      const next = trackEl(env, 'div');
+      parent.appendChild(next);
+      parent = next;
+    }
+    const deep = trackEl(env, 'button');
+    deep.id = 'deep-button';
+    parent.appendChild(deep);
+    const row = trackEl(env, 'div');
+    const wide = [];
+    for (let i = 0; i < 60; i += 1) {
+      const button = trackEl(env, 'button');
+      row.appendChild(button);
+      wide.push(button);
+    }
+    function elapsed(node, count) {
+      const start = process.hrtime.bigint();
+      for (let i = 0; i < count; i += 1) env.dispatch('click', node);
+      return Number(process.hrtime.bigint() - start) / 1e6;
+    }
+    const shallowMs = elapsed(shallow, 50);
+    const deepMs = elapsed(deep, 50);
+    const wideMs = elapsed(wide[59], 20);
+    assert.ok(shallowMs < 500, String(shallowMs));
+    assert.ok(deepMs < 500, String(deepMs));
+    assert.ok(wideMs < 500, String(wideMs));
+    assert.ok(deepMs < shallowMs * 20 + 50, shallowMs + ' -> ' + deepMs);
+    assert.strictEqual(scans, 0);
+    await env.drain();
+    const clicks = ofType(env, 'click');
+    const deepClick = clicks.find((event) => event.payload.target && event.payload.target.id === 'deep-button');
+    const lastWide = clicks.filter((event) => event.payload.target && event.payload.target.tag === 'BUTTON' && !event.payload.target.id);
+    assert.strictEqual(deepClick.payload.target.elementKey, 'deep-button');
+    assert.ok(lastWide.length >= 1);
+    assert.strictEqual(lastWide[lastWide.length - 1].payload.target.elementKey, undefined);
+    console.log('T20 ms/50 shallow=' + shallowMs.toFixed(2) + ' deep=' + deepMs.toFixed(2) + ' wide20=' + wideMs.toFixed(2));
+  });
+
+  await test('T21 identity failures still emit the original click', async () => {
+    const env = await load();
+    env.fetches.length = 0;
+    env.dispatch('click', null, { target: null });
+    const textButton = trackEl(env, 'button');
+    textButton.id = 'text-host';
+    const text = { nodeType: 3, parentNode: textButton, parentElement: textButton };
+    env.dispatch('click', text);
+    const onlyParent = { nodeType: 3, parentNode: textButton };
+    env.dispatch('click', onlyParent);
+    const path = trackEl(env, 'path');
+    path.tagName = 'path';
+    path.nodeName = 'path';
+    env.dispatch('click', path);
+    const button = trackEl(env, 'button');
+    button.id = 'guarded';
+    const span = trackEl(env, 'span');
+    button.appendChild(span);
+    button.getAttribute = () => { throw new Error('attr-secret'); };
+    button.hasAttribute = () => { throw new Error('attr-secret'); };
+    Object.defineProperty(button, 'id', { get() { throw new Error('id-secret'); } });
+    Object.defineProperty(button, 'previousElementSibling', { get() { throw new Error('sibling-secret'); } });
+    env.dispatch('click', span);
+    env.dispatch('click', span, { composedPath() { throw new Error('path-secret'); } });
+    const broken = trackEl(env, 'button');
+    broken.id = 'fallback-id';
+    const brokenSpan = trackEl(env, 'span');
+    broken.appendChild(brokenSpan);
+    env.dispatch('click', brokenSpan, { composedPath() { throw new Error('missing-path'); } });
+    await env.drain();
+    const clicks = ofType(env, 'click');
+    assert.ok(clicks.length >= 6);
+    const raw = JSON.stringify(clicks);
+    assert.ok(!raw.includes('attr-secret'));
+    assert.ok(!raw.includes('id-secret'));
+    assert.ok(!raw.includes('sibling-secret'));
+    assert.ok(!raw.includes('path-secret'));
+    const textClick = clicks.find((event) => event.payload.target && event.payload.target.id === 'text-host');
+    assert.ok(textClick);
+    assert.strictEqual(textClick.payload.target.tag, 'BUTTON');
+    assert.strictEqual(textClick.payload.target.elementKey, 'text-host');
+    const guarded = clicks.find((event) => event.payload.target && event.payload.target.tag === 'SPAN' && event.payload.target.elementType === 'button' && !event.payload.target.elementKey);
+    assert.ok(guarded);
+    const fallback = clicks.find((event) => event.payload.target && event.payload.target.elementKey === 'fallback-id');
+    assert.ok(fallback);
+    assert.strictEqual(fallback.payload.target.identitySource, 'id');
+    const svg = clicks.find((event) => event.payload.target && event.payload.target.tag === 'path');
+    assert.ok(svg);
+    assert.strictEqual(svg.payload.target.elementType, undefined);
   });
 
   console.log('\n' + passed + ' tests passed');
